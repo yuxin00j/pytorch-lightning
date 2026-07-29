@@ -30,11 +30,7 @@ from lightning_utilities.core.imports import module_available
 
 from lightning.fabric.utilities.types import _MAP_LOCATION_TYPE, _PATH
 
-import concurrent.futures
 import hashlib
-import math
-import mmap
-import multiprocessing
 import os
 import shutil
 import tempfile
@@ -49,27 +45,6 @@ except ImportError:
         def __exit__(self, *args): pass
 
 
-def _download_chunk_mmap(args):
-    start, end, path_or_url, local_path = args
-    fs = get_filesystem(path_or_url)
-    chunk_size = 128 * 1024 * 1024
-
-    with fs.open(path_or_url, "rb") as rf:
-        rf.seek(start)
-        with open(local_path, "r+b") as lf:
-            with mmap.mmap(lf.fileno(), 0) as mm:
-                bytes_read = 0
-                total_to_read = end - start
-                
-                while bytes_read < total_to_read:
-                    to_read = min(chunk_size, total_to_read - bytes_read)
-                    data = rf.read(to_read)
-                    if not data:
-                        break
-                    mm[start + bytes_read: start + bytes_read + len(data)] = data
-                    bytes_read += len(data)
-                mm.flush()
-    return True
 
 log = logging.getLogger(__name__)
 
@@ -164,25 +139,8 @@ def _load(
         if not os.path.exists(local_path) or os.path.getsize(local_path) != file_size:
             log.info(f"Downloading {path_str} ({file_size / (1024**3):.2f} GB) to {local_path} with maximum processes...")
             
-            with open(local_path, "wb") as f:
-                f.truncate(file_size)
-                
-            chunk_size = 1024 * 1024 * 1024
-            num_chunks = math.ceil(file_size / chunk_size)
-            chunks = []
-            
-            for i in range(num_chunks):
-                start = i * chunk_size
-                end = min((i + 1) * chunk_size, file_size)
-                chunks.append((start, end, path_str, local_path))
-                
             try:
-                ctx = multiprocessing.get_context("spawn")
-                with concurrent.futures.ProcessPoolExecutor(
-                    max_workers=min(16, os.cpu_count() or 1), 
-                    mp_context=ctx
-                ) as executor:
-                    list(executor.map(_download_chunk_mmap, chunks))
+                fs.get_file(path_str, local_path)
             except Exception:
                 if os.path.exists(local_path):
                     os.remove(local_path)
