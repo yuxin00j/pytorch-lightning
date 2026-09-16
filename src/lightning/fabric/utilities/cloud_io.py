@@ -13,11 +13,20 @@
 # limitations under the License.
 """Utilities related to data saving/loading."""
 
+import contextlib
 import errno
+import getpass
+import glob
+import hashlib
 import importlib
 import io
 import logging
+import os
 import shutil
+import sys
+import tempfile
+import uuid
+from collections.abc import Iterator
 from pathlib import Path
 from typing import IO, Any, Optional, Union
 
@@ -31,6 +40,103 @@ from lightning_utilities.core.imports import module_available
 from lightning.fabric.utilities.types import _MAP_LOCATION_TYPE, _PATH
 
 log = logging.getLogger(__name__)
+
+try:
+    import fcntl
+
+    _HAS_FCNTL = True
+except ImportError:  # pragma: no cover
+    _HAS_FCNTL = False
+
+# Streaming a small checkpoint straight from the object store beats paying for a local copy.
+_CACHE_MIN_SIZE_BYTES = 128 * 1024 * 1024
+_CACHE_DIR_PREFIX = "lightning_cache_"
+
+
+@contextlib.contextmanager
+def _file_lock(lock_path: str) -> Iterator[None]:
+    """Acquire an exclusive node-local advisory file lock using stdlib ``fcntl.flock`` on POSIX."""
+    if not _HAS_FCNTL:  # pragma: no cover
+        yield
+        return
+    fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        yield
+    finally:
+        with contextlib.suppress(OSError):
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        os.close(fd)
+
+
+def _get_cache_roots() -> tuple[str, ...]:
+    """Return candidate cache root directories in order of preference."""
+    return ("/dev/shm", tempfile.gettempdir())
+
+
+def _user_cache_prefix() -> str:
+    """Namespace cache directories by UID so multi-user nodes never collide in /dev/shm or /tmp."""
+    uid = str(os.getuid()) if hasattr(os, "getuid") else getpass.getuser()
+    return f"{_CACHE_DIR_PREFIX}{uid}_"
+
+
+def _torch_load(
+    path: str,
+    map_location: _MAP_LOCATION_TYPE,
+    weights_only: Optional[bool],
+) -> Any:
+    """Load a local checkpoint, memory-mapping it when the file format allows."""
+    if sys.platform != "win32":
+        try:
+            return torch.load(
+                path,
+                map_location=map_location,  # type: ignore[arg-type]
+                weights_only=weights_only,
+                mmap=True,
+            )
+        except RuntimeError as e:
+            if "mmap" not in str(e):
+                raise
+            log.debug(f"Checkpoint {path} cannot be memory-mapped ({e}); loading it normally.")
+    return torch.load(
+        path,
+        map_location=map_location,  # type: ignore[arg-type]
+        weights_only=weights_only,
+    )
+
+
+def _remote_version(file_info: dict[str, Any]) -> str:
+    """Return a token that changes whenever the remote object's content changes."""
+    for key in ("etag", "ETag", "generation", "version_id", "mtime", "LastModified", "last_modified"):
+        value = file_info.get(key)
+        if value is not None and str(value) != "":
+            return str(value)
+    return ""
+
+
+def _reclaim_superseded_entries(path_digest: str, keep: str) -> None:
+    """Delete older cache entries for the same remote path across candidate roots."""
+    prefix = f"{_user_cache_prefix()}{path_digest}_"
+    keep_abs = os.path.abspath(keep)
+    for root in _get_cache_roots():
+        for stale in glob.glob(os.path.join(root, f"{prefix}*")):
+            if stale.endswith(".lock") or os.path.abspath(stale) == keep_abs:
+                continue
+            shutil.rmtree(stale, ignore_errors=True)
+            with contextlib.suppress(OSError):
+                os.remove(f"{stale}.lock")
+
+
+def clear_cache() -> None:
+    """Remove every local checkpoint cache entry written by :func:`_load` for the current user."""
+    prefix = _user_cache_prefix()
+    for root in _get_cache_roots():
+        for entry in glob.glob(os.path.join(root, f"{prefix}*")):
+            if entry.endswith(".lock"):
+                with contextlib.suppress(OSError):
+                    os.remove(entry)
+            else:
+                shutil.rmtree(entry, ignore_errors=True)
 
 
 def _load(
@@ -57,26 +163,117 @@ def _load(
             map_location=map_location,  # type: ignore[arg-type] # upstream annotation is not correct
             weights_only=weights_only,
         )
-    if str(path_or_url).startswith("http"):
+
+    path_str = str(path_or_url)
+    if path_str.startswith("http"):
         if weights_only is None:
             weights_only = False
             log.debug(
                 f"Defaulting to `weights_only=False` for remote checkpoint: {path_or_url}."
-                f" If loading a checkpoint from an untrustted source, we recommend using `weights_only=True`."
+                f" If loading a checkpoint from an untrusted source, we recommend using `weights_only=True`."
             )
 
         return torch.hub.load_state_dict_from_url(
-            str(path_or_url),
+            path_str,
             map_location=map_location,  # type: ignore[arg-type]
             weights_only=weights_only,
         )
+
     fs = get_filesystem(path_or_url)
-    with fs.open(path_or_url, "rb") as f:
-        return torch.load(
-            f,
-            map_location=map_location,  # type: ignore[arg-type]
-            weights_only=weights_only,
-        )
+
+    # 1. Local path optimization: no copy is needed, map the file directly.
+    if _is_local_file_protocol(path_str):
+        return _torch_load(fs._strip_protocol(path_str), map_location, weights_only)
+
+    # 2. Remote checkpoint fetching via stdlib fcntl.flock + fs.get_file
+    try:
+        file_info = fs.info(path_str)
+        raw_size = file_info.get("size")
+        file_size = int(raw_size) if raw_size is not None else 0
+    except Exception:
+        file_info = {}
+        file_size = 0
+
+    version = _remote_version(file_info)
+
+    # Fall back to streaming for small files, unknown size, or a backend that exposes no version
+    # token. Caching on size alone would serve stale bytes for an overwritten checkpoint.
+    if file_size < _CACHE_MIN_SIZE_BYTES or not version:
+        if file_size >= _CACHE_MIN_SIZE_BYTES:
+            log.debug(
+                f"{path_str} exposes no version token (etag/generation/mtime), so it is streamed"
+                f" rather than cached locally."
+            )
+        with fs.open(path_str, "rb") as f:
+            return torch.load(
+                f,
+                map_location=map_location,  # type: ignore[arg-type]
+                weights_only=weights_only,
+            )
+
+    path_digest = hashlib.sha256(path_str.encode()).hexdigest()[:16]
+    version_digest = hashlib.sha256(f"{version}:{file_size}".encode()).hexdigest()[:16]
+    cache_subdir = f"{_user_cache_prefix()}{path_digest}_{version_digest}"
+
+    # Check if already cached or actively being downloaded in any candidate root before checking free space.
+    selected_root: Optional[str] = None
+    for root in _get_cache_roots():
+        candidate_dir = os.path.join(root, cache_subdir)
+        candidate = os.path.join(candidate_dir, "checkpoint.ckpt")
+        if (os.path.exists(candidate) and os.path.getsize(candidate) == file_size) or os.path.exists(
+            f"{candidate_dir}.lock"
+        ):
+            selected_root = root
+            break
+
+    if selected_root is None:
+        roots = _get_cache_roots()
+        shm_dir = roots[0] if roots else "/dev/shm"
+        has_shm = os.path.exists(shm_dir) and os.access(shm_dir, os.W_OK)
+        if has_shm:
+            try:
+                if shutil.disk_usage(shm_dir).free < file_size * 1.5:
+                    has_shm = False
+            except OSError:
+                has_shm = False
+        selected_root = shm_dir if has_shm else (roots[-1] if roots else tempfile.gettempdir())
+
+    cache_dir = os.path.join(selected_root, cache_subdir)
+    os.makedirs(cache_dir, mode=0o700, exist_ok=True)
+    with contextlib.suppress(OSError):
+        os.chmod(cache_dir, 0o700)
+
+    local_path = os.path.join(cache_dir, "checkpoint.ckpt")
+    lock_path = f"{cache_dir}.lock"
+    staging_path = os.path.join(cache_dir, f"checkpoint.ckpt.tmp.{os.getpid()}.{uuid.uuid4().hex[:8]}")
+
+    downloaded = False
+    with _file_lock(lock_path):
+        if not os.path.exists(local_path) or os.path.getsize(local_path) != file_size:
+            size_gb = file_size / (1024**3)
+            log.info(f"Fetching {path_str} ({size_gb:.2f} GB) to {staging_path}...")
+
+            try:
+                fs.get_file(path_str, staging_path)
+                staged_size = os.path.getsize(staging_path)
+                if staged_size != file_size:
+                    raise OSError(f"Truncated download of {path_str}: expected {file_size} bytes, got {staged_size}")
+                os.chmod(staging_path, 0o600)
+                os.replace(staging_path, local_path)
+                downloaded = True
+            except BaseException:
+                with contextlib.suppress(OSError):
+                    os.remove(lock_path)
+                raise
+            finally:
+                with contextlib.suppress(OSError):
+                    if os.path.exists(staging_path):
+                        os.remove(staging_path)
+
+    if downloaded:
+        _reclaim_superseded_entries(path_digest, cache_dir)
+
+    return _torch_load(local_path, map_location, weights_only)
 
 
 def get_filesystem(path: _PATH, **kwargs: Any) -> AbstractFileSystem:

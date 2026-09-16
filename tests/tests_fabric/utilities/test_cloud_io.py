@@ -12,9 +12,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import errno
+import glob
+import hashlib
 import io
+import multiprocessing as mp
 import os
+import shutil
+import sys
 from pathlib import Path
+from types import SimpleNamespace
 from unittest import mock
 
 import fsspec
@@ -28,9 +34,12 @@ from lightning.fabric.utilities.cloud_io import (
     _checkpoint_join,
     _is_checkpoint_dir,
     _is_dir,
+    _load,
     _prepare_directory_checkpoint,
     _remove_checkpoint,
     _resolve_path,
+    _user_cache_prefix,
+    clear_cache,
     get_filesystem,
 )
 
@@ -333,3 +342,435 @@ def test_atomic_save_local_interrupted_save_creates_no_partial_file(tmp_path):
 
     assert not filepath.exists()
     assert os.listdir(tmp_path) == []
+
+
+def _big_checkpoint(path, fill=0.0):
+    """Write a checkpoint above the monkeypatched _CACHE_MIN_SIZE_BYTES threshold (1024 bytes)."""
+    torch.save({"weights": torch.full((4096,), fill, dtype=torch.float32)}, path)
+    return os.path.getsize(path)
+
+
+def _versioned_fs(src, size, version="v1", calls=None):
+    """A stub filesystem that reports a version token, like S3/GCS do."""
+
+    class DummyFS:
+        def info(self, path):
+            return {"size": size, "etag": version}
+
+        def open(self, path, mode):
+            return open(src, mode)
+
+        def get_file(self, rpath, lpath):
+            if calls is not None:
+                calls.append((rpath, lpath))
+            shutil.copyfile(src, lpath)
+
+    return DummyFS()
+
+
+def _use_tmp_cache_root(tmp_path, monkeypatch):
+    """Route all cache roots into `tmp_path` and lower the size threshold for fast unit tests."""
+    monkeypatch.setattr("lightning.fabric.utilities.cloud_io._CACHE_MIN_SIZE_BYTES", 1024)
+    monkeypatch.setattr("lightning.fabric.utilities.cloud_io._is_local_file_protocol", lambda _: False)
+    monkeypatch.setattr("lightning.fabric.utilities.cloud_io._get_cache_roots", lambda: (str(tmp_path),))
+
+
+def test_load_local_file_uri(tmp_path):
+    """file:// URIs must be stripped before calling torch.load."""
+    checkpoint = {"weights": torch.tensor([1.0, 2.0, 3.0])}
+    ckpt_path = tmp_path / "local_uri.ckpt"
+    torch.save(checkpoint, ckpt_path)
+
+    file_uri = ckpt_path.as_uri()
+    assert file_uri.startswith("file://")
+    loaded = _load(file_uri, map_location="cpu")
+    torch.testing.assert_close(loaded["weights"], checkpoint["weights"])
+
+
+def test_load_remote_small_file_streaming(tmp_path, monkeypatch):
+    checkpoint = {"weights": torch.tensor([1.0, 2.0, 3.0])}
+    ckpt_path = tmp_path / "small.ckpt"
+    torch.save(checkpoint, ckpt_path)
+
+    monkeypatch.setattr("lightning.fabric.utilities.cloud_io._is_local_file_protocol", lambda _: False)
+    loaded = _load(str(ckpt_path), map_location="cpu")
+    torch.testing.assert_close(loaded["weights"], checkpoint["weights"])
+
+
+def test_load_remote_size_none_and_version_zero(tmp_path, monkeypatch):
+    """fs.info() returning size=None must stream without TypeError; generation=0 must be accepted as a valid version."""
+    ckpt_path = tmp_path / "size_none.ckpt"
+    size = _big_checkpoint(ckpt_path, fill=3.0)
+    _use_tmp_cache_root(tmp_path, monkeypatch)
+
+    class SizeNoneFS:
+        def info(self, path):
+            return {"size": None, "etag": "v1"}
+
+        def open(self, path, mode):
+            return open(ckpt_path, mode)
+
+    monkeypatch.setattr("lightning.fabric.utilities.cloud_io.get_filesystem", lambda _: SizeNoneFS())
+    loaded = _load(str(ckpt_path), map_location="cpu")
+    assert torch.all(loaded["weights"] == 3.0)
+
+    # Now test generation=0 (numeric zero version token should cache, not be treated as falsy)
+    calls = []
+
+    class GenZeroFS:
+        def info(self, path):
+            return {"size": size, "generation": 0}
+
+        def get_file(self, rpath, lpath):
+            calls.append(rpath)
+            shutil.copyfile(ckpt_path, lpath)
+
+    monkeypatch.setattr("lightning.fabric.utilities.cloud_io.get_filesystem", lambda _: GenZeroFS())
+    res = _load(str(ckpt_path), map_location="cpu")
+    assert torch.all(res["weights"] == 3.0)
+    assert len(calls) == 1
+
+
+def test_load_remote_large_file_delegates_to_get_file_with_cache(tmp_path, monkeypatch):
+    ckpt_path = tmp_path / "large.ckpt"
+    size = _big_checkpoint(ckpt_path)
+
+    _use_tmp_cache_root(tmp_path, monkeypatch)
+    get_file_calls = []
+    monkeypatch.setattr(
+        "lightning.fabric.utilities.cloud_io.get_filesystem",
+        lambda _: _versioned_fs(ckpt_path, size, calls=get_file_calls),
+    )
+
+    orig_load = torch.load
+    load_kwargs = {}
+
+    def spy_load(f, *args, **kwargs):
+        load_kwargs.update(kwargs)
+        return orig_load(f, *args, **kwargs)
+
+    monkeypatch.setattr(torch, "load", spy_load)
+
+    # First call downloads via get_file into a unique staging file, then promotes it
+    res = _load(str(ckpt_path), map_location="cpu")
+    assert res["weights"].shape == (4096,)
+    assert len(get_file_calls) == 1
+    assert get_file_calls[0][0] == str(ckpt_path)
+    assert f"checkpoint.ckpt.tmp.{os.getpid()}." in get_file_calls[0][1]
+    if sys.platform != "win32":
+        assert load_kwargs.get("mmap") is True
+    else:
+        assert "mmap" not in load_kwargs
+
+    # Second call hits the cache and skips get_file entirely
+    res2 = _load(str(ckpt_path), map_location="cpu")
+    assert res2["weights"].shape == (4096,)
+    assert len(get_file_calls) == 1
+
+
+def test_load_remote_new_version_invalidates_same_size_cache(tmp_path, monkeypatch):
+    """An overwritten checkpoint of identical size must not be served from the cache."""
+    ckpt_path = tmp_path / "last.ckpt"
+    size = _big_checkpoint(ckpt_path, fill=1.0)
+
+    _use_tmp_cache_root(tmp_path, monkeypatch)
+    calls = []
+    monkeypatch.setattr(
+        "lightning.fabric.utilities.cloud_io.get_filesystem",
+        lambda _: _versioned_fs(ckpt_path, size, version="epoch-1", calls=calls),
+    )
+    first = _load(str(ckpt_path), map_location="cpu")
+    assert torch.all(first["weights"] == 1.0)
+    assert len(calls) == 1
+
+    # The trainer overwrites the same remote path; the size is unchanged but the content is not.
+    new_size = _big_checkpoint(ckpt_path, fill=2.0)
+    assert new_size == size
+    monkeypatch.setattr(
+        "lightning.fabric.utilities.cloud_io.get_filesystem",
+        lambda _: _versioned_fs(ckpt_path, new_size, version="epoch-2", calls=calls),
+    )
+
+    second = _load(str(ckpt_path), map_location="cpu")
+    assert torch.all(second["weights"] == 2.0), "stale cache served the previous version"
+    assert len(calls) == 2
+
+    # The superseded entry is reclaimed rather than left behind as a second full-size copy.
+    prefix = _user_cache_prefix()
+    entries = [d for d in os.listdir(tmp_path) if d.startswith(prefix) and not d.endswith(".lock")]
+    assert len(entries) == 1
+
+
+def test_load_remote_without_version_token_is_not_cached(tmp_path, monkeypatch):
+    """Without a version token the cache cannot be invalidated safely, so stream instead."""
+    ckpt_path = tmp_path / "unversioned.ckpt"
+    size = _big_checkpoint(ckpt_path)
+
+    _use_tmp_cache_root(tmp_path, monkeypatch)
+
+    class NoVersionFS:
+        def info(self, path):
+            return {"size": size}
+
+        def open(self, path, mode):
+            return open(path, mode)
+
+        def get_file(self, rpath, lpath):
+            raise AssertionError("must not cache an object with no version token")
+
+    monkeypatch.setattr("lightning.fabric.utilities.cloud_io.get_filesystem", lambda _: NoVersionFS())
+
+    res = _load(str(ckpt_path), map_location="cpu")
+    assert res["weights"].shape == (4096,)
+    prefix = _user_cache_prefix()
+    assert [d for d in os.listdir(tmp_path) if d.startswith(prefix)] == []
+
+
+def test_load_legacy_non_zipfile_checkpoint(tmp_path, monkeypatch):
+    """Checkpoints that cannot be memory-mapped must still load, locally and from the cache."""
+    ckpt_path = tmp_path / "legacy.ckpt"
+    torch.save({"weights": torch.tensor([7.0, 8.0])}, ckpt_path, _use_new_zipfile_serialization=False)
+
+    # Local path
+    loaded = _load(str(ckpt_path), map_location="cpu")
+    torch.testing.assert_close(loaded["weights"], torch.tensor([7.0, 8.0]))
+
+    # Remote path through the cache
+    padded = tmp_path / "legacy_big.ckpt"
+    torch.save(
+        {"weights": torch.arange(4096, dtype=torch.float32)},
+        padded,
+        _use_new_zipfile_serialization=False,
+    )
+    size = os.path.getsize(padded)
+
+    _use_tmp_cache_root(tmp_path, monkeypatch)
+    monkeypatch.setattr(
+        "lightning.fabric.utilities.cloud_io.get_filesystem",
+        lambda _: _versioned_fs(padded, size),
+    )
+    res = _load(str(padded), map_location="cpu")
+    assert res["weights"].shape == (4096,)
+
+
+def test_load_remote_truncated_download_is_rejected(tmp_path, monkeypatch):
+    """A short read must never be promoted into the cache."""
+    ckpt_path = tmp_path / "truncated.ckpt"
+    ckpt_path.write_bytes(b"x" * 2048)
+
+    _use_tmp_cache_root(tmp_path, monkeypatch)
+
+    class TruncatingFS:
+        def info(self, path):
+            return {"size": 4096, "etag": "v1"}
+
+        def get_file(self, rpath, lpath):
+            with open(lpath, "wb") as f:
+                f.write(b"short")
+
+    monkeypatch.setattr("lightning.fabric.utilities.cloud_io.get_filesystem", lambda _: TruncatingFS())
+
+    with pytest.raises(OSError, match="Truncated download"):
+        _load(str(ckpt_path), map_location="cpu")
+
+    prefix = _user_cache_prefix()
+    for d in os.listdir(tmp_path):
+        if d.startswith(prefix) and not d.endswith(".lock"):
+            assert not os.path.exists(os.path.join(tmp_path, d, "checkpoint.ckpt"))
+
+
+def test_load_remote_cache_is_not_world_readable(tmp_path, monkeypatch):
+    """A cached checkpoint bypasses storage ACLs, so it must stay inside one UID."""
+    ckpt_path = tmp_path / "private.ckpt"
+    size = _big_checkpoint(ckpt_path)
+
+    _use_tmp_cache_root(tmp_path, monkeypatch)
+    monkeypatch.setattr(
+        "lightning.fabric.utilities.cloud_io.get_filesystem",
+        lambda _: _versioned_fs(ckpt_path, size),
+    )
+    _load(str(ckpt_path), map_location="cpu")
+
+    prefix = _user_cache_prefix()
+    entries = [d for d in os.listdir(tmp_path) if d.startswith(prefix) and not d.endswith(".lock")]
+    assert len(entries) == 1
+    cache_dir = os.path.join(tmp_path, entries[0])
+    dir_mode = os.stat(cache_dir).st_mode
+    assert not dir_mode & 0o077, f"cache dir is group/world accessible: {oct(dir_mode & 0o777)}"
+    file_mode = os.stat(os.path.join(cache_dir, "checkpoint.ckpt")).st_mode
+    assert not file_mode & 0o077, f"cached checkpoint is group/world readable: {oct(file_mode & 0o777)}"
+
+
+def test_load_remote_cleanup_on_exception(tmp_path, monkeypatch):
+    ckpt_path = tmp_path / "error.ckpt"
+    ckpt_path.write_bytes(b"dummy")
+
+    _use_tmp_cache_root(tmp_path, monkeypatch)
+
+    class FailingFS:
+        def info(self, path):
+            return {"size": 4096, "etag": "v1"}
+
+        def get_file(self, rpath, lpath):
+            with open(lpath, "wb") as f:
+                f.write(b"partial")
+            raise RuntimeError("simulated download failure")
+
+    monkeypatch.setattr("lightning.fabric.utilities.cloud_io.get_filesystem", lambda _: FailingFS())
+
+    with pytest.raises(RuntimeError, match="simulated download failure"):
+        _load(str(ckpt_path), map_location="cpu")
+
+    prefix = _user_cache_prefix()
+    for d in os.listdir(tmp_path):
+        if d.startswith(prefix) and not d.endswith(".lock"):
+            cache_dir = os.path.join(tmp_path, d)
+            assert not os.path.exists(os.path.join(cache_dir, "checkpoint.ckpt"))
+            assert not glob.glob(os.path.join(cache_dir, "checkpoint.ckpt.tmp.*"))
+
+
+def test_load_remote_atomic_staging_recovery(tmp_path, monkeypatch):
+    """An orphaned staging file from a killed process must not be mistaken for the payload."""
+    ckpt_path = tmp_path / "staged.ckpt"
+    size = _big_checkpoint(ckpt_path)
+
+    _use_tmp_cache_root(tmp_path, monkeypatch)
+    monkeypatch.setattr(
+        "lightning.fabric.utilities.cloud_io.get_filesystem",
+        lambda _: _versioned_fs(ckpt_path, size),
+    )
+
+    path_digest = hashlib.sha256(str(ckpt_path).encode()).hexdigest()[:16]
+    version_digest = hashlib.sha256(f"v1:{size}".encode()).hexdigest()[:16]
+    cache_dir = tmp_path / f"{_user_cache_prefix()}{path_digest}_{version_digest}"
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    orphan_tmp = cache_dir / "checkpoint.ckpt.tmp.999999.deadbeef"
+    orphan_tmp.write_bytes(b"0" * 1024)
+
+    res = _load(str(ckpt_path), map_location="cpu")
+    assert res["weights"].shape == (4096,)
+    assert (cache_dir / "checkpoint.ckpt").exists()
+    assert os.path.getsize(cache_dir / "checkpoint.ckpt") == size
+
+
+def test_load_remote_info_exception_fallback(tmp_path, monkeypatch):
+    checkpoint = {"weights": torch.tensor([5.0])}
+    ckpt_path = tmp_path / "fallback.ckpt"
+    torch.save(checkpoint, ckpt_path)
+
+    monkeypatch.setattr("lightning.fabric.utilities.cloud_io._is_local_file_protocol", lambda _: False)
+
+    class ErrorFS:
+        def info(self, path):
+            raise FileNotFoundError("info not supported")
+
+        def open(self, path, mode):
+            return open(path, mode)
+
+    monkeypatch.setattr("lightning.fabric.utilities.cloud_io.get_filesystem", lambda _: ErrorFS())
+    loaded = _load(str(ckpt_path), map_location="cpu")
+    torch.testing.assert_close(loaded["weights"], checkpoint["weights"])
+
+
+def test_load_remote_shm_cache_and_repeat_hit_when_free_space_drops(tmp_path, monkeypatch):
+    """Once cached in /dev/shm, subsequent loads must hit /dev/shm even if free space drops below 1.5x."""
+    ckpt_path = tmp_path / "shm.ckpt"
+    size = _big_checkpoint(ckpt_path)
+
+    fake_shm = tmp_path / "fake_shm"
+    fake_tmp = tmp_path / "fake_tmp"
+    fake_shm.mkdir()
+    fake_tmp.mkdir()
+
+    monkeypatch.setattr("lightning.fabric.utilities.cloud_io._CACHE_MIN_SIZE_BYTES", 1024)
+    monkeypatch.setattr("lightning.fabric.utilities.cloud_io._is_local_file_protocol", lambda _: False)
+    monkeypatch.setattr("lightning.fabric.utilities.cloud_io._get_cache_roots", lambda: (str(fake_shm), str(fake_tmp)))
+
+    calls = []
+    monkeypatch.setattr(
+        "lightning.fabric.utilities.cloud_io.get_filesystem",
+        lambda _: _versioned_fs(ckpt_path, size, calls=calls),
+    )
+
+    # Initially plenty of free space in fake_shm
+    free_bytes = [size * 10]
+    monkeypatch.setattr(shutil, "disk_usage", lambda _: SimpleNamespace(total=size * 20, used=size, free=free_bytes[0]))
+
+    res1 = _load(str(ckpt_path), map_location="cpu")
+    assert res1["weights"].shape == (4096,)
+    assert len(calls) == 1
+    prefix = _user_cache_prefix()
+    assert [d for d in os.listdir(fake_shm) if d.startswith(prefix) and not d.endswith(".lock")]
+    assert [d for d in os.listdir(fake_tmp) if d.startswith(prefix)] == []
+
+    # Simulate free space dropping below 1.5 * size after the first download
+    free_bytes[0] = int(size * 0.5)
+    res2 = _load(str(ckpt_path), map_location="cpu")
+    assert res2["weights"].shape == (4096,)
+    # Must hit existing fake_shm cache and NOT download a duplicate into fake_tmp
+    assert len(calls) == 1
+    assert [d for d in os.listdir(fake_tmp) if d.startswith(prefix)] == []
+
+
+def test_clear_cache_removes_entries(tmp_path, monkeypatch):
+    ckpt_path = tmp_path / "purge.ckpt"
+    size = _big_checkpoint(ckpt_path)
+
+    _use_tmp_cache_root(tmp_path, monkeypatch)
+    monkeypatch.setattr(
+        "lightning.fabric.utilities.cloud_io.get_filesystem",
+        lambda _: _versioned_fs(ckpt_path, size),
+    )
+    _load(str(ckpt_path), map_location="cpu")
+    prefix = _user_cache_prefix()
+    assert [d for d in os.listdir(tmp_path) if d.startswith(prefix)]
+
+    clear_cache()
+    assert [d for d in os.listdir(tmp_path) if d.startswith(prefix)] == []
+
+
+def _mp_worker(ckpt_path_str, cache_root_str, counter_dir_str, size, barrier):
+    from lightning.fabric.utilities import cloud_io
+
+    class MPStubFS:
+        def info(self, path):
+            return {"size": size, "etag": "mp-v1"}
+
+        def get_file(self, rpath, lpath):
+            (Path(counter_dir_str) / f"call.{os.getpid()}").write_text(lpath)
+            shutil.copyfile(rpath, lpath)
+
+    cloud_io._CACHE_MIN_SIZE_BYTES = 1024
+    cloud_io._is_local_file_protocol = lambda _: False
+    cloud_io._get_cache_roots = lambda: (cache_root_str,)
+    cloud_io.get_filesystem = lambda _: MPStubFS()
+
+    barrier.wait()
+    res = cloud_io._load(ckpt_path_str, map_location="cpu")
+    assert res["weights"].shape == (4096,)
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="fork-based barrier test")
+def test_load_remote_multiprocess_singleflight(tmp_path):
+    """Multiple processes loading the same remote checkpoint concurrently must download it exactly once."""
+    ckpt_path = tmp_path / "mp.ckpt"
+    size = _big_checkpoint(ckpt_path, fill=4.0)
+    cache_root = tmp_path / "mp_cache"
+    counter_dir = tmp_path / "mp_calls"
+    cache_root.mkdir()
+    counter_dir.mkdir()
+
+    ctx = mp.get_context("fork")
+    nprocs = 4
+    barrier = ctx.Barrier(nprocs)
+    procs = [
+        ctx.Process(target=_mp_worker, args=(str(ckpt_path), str(cache_root), str(counter_dir), size, barrier))
+        for _ in range(nprocs)
+    ]
+    for p in procs:
+        p.start()
+    for p in procs:
+        p.join()
+
+    assert [p.exitcode for p in procs] == [0] * nprocs
+    assert len(list(counter_dir.glob("call.*"))) == 1
