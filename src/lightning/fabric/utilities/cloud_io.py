@@ -19,7 +19,7 @@ import io
 import logging
 import shutil
 from pathlib import Path
-from typing import IO, Any, Optional, Union
+from typing import IO, Any, Callable, Optional, Sequence, Union
 
 import fsspec
 import fsspec.utils
@@ -285,3 +285,165 @@ def _import_fsspec_dcp_filesystem(name: str) -> Any:
             " PyTorch build. Use a local checkpoint path or upgrade PyTorch."
         ) from e
     return getattr(module, name)
+
+
+_BROADCAST_BUCKET_BYTES = 250 * 1024 * 1024
+
+
+def _is_dist_multi_rank() -> bool:
+    return (
+        torch.distributed.is_available()
+        and torch.distributed.is_initialized()
+        and torch.distributed.get_world_size() > 1
+    )
+
+
+def _load_dist_checkpoint_rank0(
+    load_fn: Callable[[], Any],
+    tensor_keys: Sequence[str] = ("state_dict", "optimizer_states"),
+) -> Any:
+    """Load a full checkpoint on rank 0 only and broadcast non-tensor metadata to peers."""
+    if not _is_dist_multi_rank():
+        return load_fn()
+
+    if torch.distributed.get_rank() == 0:
+        checkpoint = load_fn()
+        if not isinstance(checkpoint, dict):
+            broadcast_list = [False, checkpoint, {}]
+            torch.distributed.broadcast_object_list(broadcast_list, src=0)
+            return checkpoint
+
+        saved_tensors: dict[str, Any] = {}
+        key_shapes: dict[str, int] = {}
+        for k in tensor_keys:
+            if k in checkpoint:
+                val = checkpoint.pop(k)
+                saved_tensors[k] = val
+                key_shapes[k] = len(val) if isinstance(val, list) else -1
+
+        is_raw_state_dict = not saved_tensors and any(isinstance(v, torch.Tensor) for v in checkpoint.values())
+        if is_raw_state_dict:
+            broadcast_list = [True, None, {}]
+            torch.distributed.broadcast_object_list(broadcast_list, src=0)
+            return checkpoint
+
+        broadcast_list = [False, checkpoint, key_shapes]
+        torch.distributed.broadcast_object_list(broadcast_list, src=0)
+        checkpoint.update(saved_tensors)
+        return checkpoint
+
+    broadcast_list = [False, None, None]
+    torch.distributed.broadcast_object_list(broadcast_list, src=0)
+    is_raw_state_dict, checkpoint_meta, key_shapes = broadcast_list
+    if is_raw_state_dict:
+        return {}
+    if not isinstance(checkpoint_meta, dict):
+        return checkpoint_meta
+    checkpoint = dict(checkpoint_meta)
+    for k, length in key_shapes.items():
+        checkpoint[k] = [{} for _ in range(length)] if length >= 0 else {}
+    return checkpoint
+
+
+def _broadcast_tensors_bucketed(
+    tensors: Sequence[torch.Tensor],
+    bucket_bytes: int = _BROADCAST_BUCKET_BYTES,
+) -> None:
+    """Broadcast a sequence of tensors from rank 0 in coalesced buckets."""
+    if not tensors:
+        return
+    pg = torch.distributed.distributed_c10d._get_default_group()
+    pg_device_types = {d.type for d in pg._device_types}
+
+    bucket: list[torch.Tensor] = []
+    pending_bytes = 0
+
+    def _flush(batch: list[torch.Tensor]) -> None:
+        if not batch:
+            return
+        if batch[0].device.type in pg_device_types:
+            if len(batch) > 1:
+                torch.distributed._broadcast_coalesced(pg, batch, bucket_bytes, 0)
+            else:
+                torch.distributed.broadcast(batch[0], src=0, group=pg)
+        else:
+            pg_dev = pg._device_types[0]
+            rank = torch.distributed.get_rank()
+            staged = [t.to(pg_dev) if rank == 0 else torch.empty_like(t, device=pg_dev) for t in batch]
+            if len(staged) > 1:
+                torch.distributed._broadcast_coalesced(pg, staged, bucket_bytes, 0)
+            else:
+                torch.distributed.broadcast(staged[0], src=0, group=pg)
+            if rank != 0:
+                for dst, src in zip(batch, staged):
+                    dst.copy_(src)
+
+    for t in tensors:
+        bucket.append(t)
+        pending_bytes += t.numel() * t.element_size()
+        if pending_bytes >= bucket_bytes:
+            _flush(bucket)
+            bucket.clear()
+            pending_bytes = 0
+
+    if bucket:
+        _flush(bucket)
+
+
+def _broadcast_optimizer_state_dict_rank0(
+    optimizer: torch.optim.Optimizer,
+    opt_state: dict[str, Any],
+    device: torch.device,
+) -> None:
+    """Load optimizer state on rank 0 and broadcast state tensors in-place to peers in buckets."""
+    from lightning.fabric.utilities.optimizer import _optimizer_to_device
+
+    rank = torch.distributed.get_rank()
+    if rank == 0:
+        optimizer.load_state_dict(opt_state)
+        _optimizer_to_device(optimizer, device)
+        opt_state.clear()
+        osd = optimizer.state_dict()
+        state_meta: dict[Any, dict[str, Any]] = {}
+        for param_key, param_state in osd["state"].items():
+            meta_entry: dict[str, Any] = {}
+            for k, v in param_state.items():
+                if isinstance(v, torch.Tensor) and v.dim() > 0:
+                    meta_entry[k] = ("__tensor__", tuple(v.shape), v.dtype)
+                elif isinstance(v, torch.Tensor):
+                    meta_entry[k] = v.cpu()
+                else:
+                    meta_entry[k] = v
+            state_meta[param_key] = meta_entry
+        broadcast_list = [state_meta, osd["param_groups"]]
+    else:
+        broadcast_list = [None, None]
+
+    torch.distributed.broadcast_object_list(broadcast_list, src=0)
+    state_meta, param_groups = broadcast_list
+
+    if rank != 0:
+        peer_state: dict[Any, dict[str, Any]] = {}
+        for param_key, meta_entry in state_meta.items():
+            param_state: dict[str, Any] = {}
+            for k, v in meta_entry.items():
+                if isinstance(v, tuple) and len(v) == 3 and v[0] == "__tensor__":
+                    _, shape, dtype = v
+                    param_state[k] = torch.empty(shape, dtype=dtype, device=device)
+                else:
+                    param_state[k] = v
+            peer_state[param_key] = param_state
+        optimizer.load_state_dict({"state": peer_state, "param_groups": param_groups})
+        _optimizer_to_device(optimizer, device)
+
+    tensors_to_broadcast: list[torch.Tensor] = []
+    for param in [p for group in optimizer.param_groups for p in group["params"]]:
+        if param in optimizer.state:
+            param_state = optimizer.state[param]
+            for k in sorted(param_state.keys()):
+                v = param_state[k]
+                if isinstance(v, torch.Tensor) and v.dim() > 0:
+                    tensors_to_broadcast.append(v.detach())
+
+    _broadcast_tensors_bucketed(tensors_to_broadcast)
+

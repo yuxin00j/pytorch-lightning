@@ -52,8 +52,10 @@ from lightning.fabric.utilities.cloud_io import (
     _checkpoint_join,
     _get_distributed_checkpoint_reader,
     _is_checkpoint_dir,
+    _is_dist_multi_rank,
     _is_local_file_protocol,
     _load,
+    _load_dist_checkpoint_rank0,
     _prepare_directory_checkpoint,
     _remove_checkpoint,
     _resolve_path,
@@ -610,10 +612,14 @@ class FSDPStrategy(ParallelStrategy, _Sharded):
             return metadata
 
         if _is_full_checkpoint(path):
-            checkpoint = (
-                _lazy_load(path)
-                if _is_local_file_protocol(str(path))
-                else _load(path, weights_only=False if weights_only is None else weights_only)
+            tensor_keys = tuple(modules.keys()) + tuple(optimizers.keys()) + ("state_dict", "optimizer_states")
+            checkpoint = _load_dist_checkpoint_rank0(
+                lambda: (
+                    _materialize_tensors(_lazy_load(path))
+                    if _is_local_file_protocol(str(path))
+                    else _load(path, weights_only=False if weights_only is None else weights_only)
+                ),
+                tensor_keys=tensor_keys,
             )
 
             from lightning.fabric.strategies.model_parallel import (
@@ -632,8 +638,7 @@ class FSDPStrategy(ParallelStrategy, _Sharded):
 
             # Load optimizer states
             for optim_key, optim in optimizers.items():
-                # rank0_only should be false because we need to load the optimizer state on all ranks
-                with _get_full_state_dict_context(module, world_size=self.world_size, rank0_only=False):
+                with _get_full_state_dict_context(module, world_size=self.world_size, rank0_only=_is_dist_multi_rank()):
                     temp_state_dict = _rekey_optimizer_state_if_needed(checkpoint.pop(optim_key), module)
                     optim_state_dict = FSDP.optim_state_dict_to_load(
                         optim_state_dict=temp_state_dict,

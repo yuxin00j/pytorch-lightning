@@ -53,13 +53,15 @@ from lightning.fabric.strategies.fsdp import (
     _setup_activation_checkpointing,
     _warn_if_shared_params_across_fsdp_units,
 )
-from lightning.fabric.strategies.model_parallel import _load_raw_module_state
+from lightning.fabric.strategies.model_parallel import _load_raw_module_state, _rekey_optimizer_state_if_needed
 from lightning.fabric.utilities.cloud_io import (
     _atomic_save,
     _checkpoint_join,
     _is_checkpoint_dir,
+    _is_dist_multi_rank,
     _is_local_file_protocol,
     _load,
+    _load_dist_checkpoint_rank0,
     _prepare_directory_checkpoint,
     _remove_checkpoint,
     _resolve_path,
@@ -644,10 +646,13 @@ class FSDPStrategy(ParallelStrategy):
             return metadata
 
         if _is_full_checkpoint(path):
-            checkpoint = (
-                _lazy_load(path)
-                if _is_local_file_protocol(str(path))
-                else _load(path, weights_only=False if weights_only is None else weights_only)
+            checkpoint = _load_dist_checkpoint_rank0(
+                lambda: (
+                    _materialize_tensors(_lazy_load(path))
+                    if _is_local_file_protocol(str(path))
+                    else _load(path, weights_only=False if weights_only is None else weights_only)
+                ),
+                tensor_keys=("state_dict", "optimizer_states"),
             )
             _load_raw_module_state(
                 checkpoint.pop("state_dict"),
@@ -661,7 +666,6 @@ class FSDPStrategy(ParallelStrategy):
             checkpoint = _materialize_tensors(checkpoint)
 
             from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
-            from torch.distributed.fsdp import OptimStateKeyType
 
             optimizer_states = checkpoint.get("optimizer_states")
             if optimizer_states is None or self.lightning_module.trainer.state.fn != TrainerFn.FITTING:
@@ -674,13 +678,9 @@ class FSDPStrategy(ParallelStrategy):
                     " of optimizers or edit the checkpoint manually to remove states."
                 )
 
-            # rank0_only should be false because we need to load the optimizer state on all ranks
-            with _get_full_state_dict_context(self.model, world_size=self.world_size, rank0_only=False):
+            with _get_full_state_dict_context(self.model, world_size=self.world_size, rank0_only=_is_dist_multi_rank()):
                 for optimizer, opt_state in zip(self.optimizers, optimizer_states):
-                    if isinstance(list(opt_state["state"].keys())[0], int):
-                        # Handling the case where the optimizer state is saved from a normal optimizer
-                        opt_state = FSDP.rekey_optim_state_dict(opt_state, OptimStateKeyType.PARAM_NAME, self.model)
-
+                    opt_state = _rekey_optimizer_state_if_needed(opt_state, self.model)
                     opt_state = FSDP.optim_state_dict_to_load(
                         optim_state_dict=opt_state,
                         model=self.model,

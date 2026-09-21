@@ -428,3 +428,126 @@ def test_model_parallel_load_checkpoint_loads_non_tensor_metadata(monkeypatch, t
     mp._load_checkpoint(path=ckpt_dir, state=state, strict=False)
     assert isinstance(state["user_meta"], _NonTensorMeta)
     assert state["user_meta"].value == 42
+
+
+@RunIf(min_torch="2.4")
+def test_load_raw_module_state_dtensor_single_call(monkeypatch):
+    """Verify _load_raw_module_state calls set_model_state_dict once on root module instead of per parameter."""
+    from lightning.fabric.strategies import model_parallel as mp
+
+    model = nn.Sequential(nn.Linear(4, 4), nn.Linear(4, 2))
+    full_sd = model.state_dict()
+
+    monkeypatch.setattr(mp, "_has_dtensor_modules", lambda m: True)
+    calls = []
+    monkeypatch.setattr(
+        "torch.distributed.checkpoint.state_dict.set_model_state_dict",
+        lambda mod, sd, options=None: calls.append((mod, dict(sd))),
+    )
+
+    mp._load_raw_module_state(full_sd, model, strict=True)
+    assert len(calls) == 1
+    assert calls[0][0] is model
+    assert set(calls[0][1].keys()) == set(full_sd.keys())
+
+    with pytest.raises(KeyError, match="does not exist in the loaded checkpoint"):
+        mp._load_raw_module_state({"0.weight": full_sd["0.weight"]}, model, strict=True)
+
+
+def _rank0_broadcast_worker(rank: int, world_size: int, port: int, tmp_file: str) -> None:
+    import os
+
+    import torch.distributed as dist
+    from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+    from torch.distributed.fsdp.wrap import ModuleWrapPolicy
+
+    from lightning.fabric.strategies.model_parallel import _load_raw_module_state
+    from lightning.fabric.utilities.cloud_io import (
+        _broadcast_optimizer_state_dict_rank0,
+        _load_dist_checkpoint_rank0,
+    )
+
+    os.environ["MASTER_ADDR"] = "127.0.0.1"
+    os.environ["MASTER_PORT"] = str(port)
+    dist.init_process_group("gloo", rank=rank, world_size=world_size)
+    try:
+        load_calls = 0
+
+        def _loader():
+            nonlocal load_calls
+            load_calls += 1
+            return torch.load(tmp_file, weights_only=False)
+
+        ckpt = _load_dist_checkpoint_rank0(_loader, tensor_keys=("state_dict", "optimizer_states"))
+        if rank == 0:
+            assert load_calls == 1
+            assert len(ckpt["state_dict"]) > 0
+        else:
+            assert load_calls == 0
+            assert ckpt["state_dict"] == {}
+            assert ckpt["optimizer_states"] == [{}]
+        assert ckpt["epoch"] == 7
+
+        # 1. Test DDP / plain module + optimizer broadcast
+        ddp_model = nn.Sequential(nn.Linear(4, 4), nn.Linear(4, 2))
+        for p in ddp_model.parameters():
+            nn.init.zeros_(p)
+        ddp_opt = torch.optim.AdamW(ddp_model.parameters(), lr=1e-3)
+        _load_raw_module_state(dict(ckpt["state_dict"]), ddp_model, world_size=world_size, strict=True)
+        _broadcast_optimizer_state_dict_rank0(ddp_opt, dict(ckpt["optimizer_states"][0]), torch.device("cpu"))
+
+        ref = torch.load(tmp_file, weights_only=False)
+        for k, v in ddp_model.state_dict().items():
+            assert torch.equal(v, ref["state_dict"][k])
+        for p in ddp_model.parameters():
+            assert "exp_avg" in ddp_opt.state[p]
+            assert torch.all(ddp_opt.state[p]["exp_avg"] == 3.5)
+
+        # 2. Test FSDP per-unit summon_full_params + broadcast
+        base_model = nn.Sequential(nn.Linear(4, 4), nn.Linear(4, 2))
+        for p in base_model.parameters():
+            nn.init.zeros_(p)
+        fsdp_model = FSDP(
+            base_model,
+            auto_wrap_policy=ModuleWrapPolicy({nn.Linear}),
+            device_id=torch.device("cpu"),
+        )
+        peer_sd = dict(ref["state_dict"]) if rank == 0 else {}
+        _load_raw_module_state(peer_sd, fsdp_model, world_size=world_size, strict=True)
+        with FSDP.summon_full_params(fsdp_model):
+            for k, v in fsdp_model.state_dict().items():
+                assert torch.equal(v, ref["state_dict"][k])
+    finally:
+        dist.destroy_process_group()
+
+
+@RunIf(min_torch="2.4")
+def test_rank0_checkpoint_load_and_broadcast_ddp_and_fsdp(tmp_path):
+    """Verify only rank 0 reads the checkpoint file and broadcasts model/optimizer states for DDP and FSDP."""
+    import socket
+    import torch.multiprocessing as mp_spawn
+
+    ref_model = nn.Sequential(nn.Linear(4, 4), nn.Linear(4, 2))
+    ref_opt = torch.optim.AdamW(ref_model.parameters(), lr=1e-3)
+    for p in ref_model.parameters():
+        p.grad = torch.ones_like(p)
+    ref_opt.step()
+    for p in ref_model.parameters():
+        ref_opt.state[p]["exp_avg"].fill_(3.5)
+
+    ckpt_file = tmp_path / "full.ckpt"
+    torch.save(
+        {
+            "state_dict": ref_model.state_dict(),
+            "optimizer_states": [ref_opt.state_dict()],
+            "epoch": 7,
+        },
+        ckpt_file,
+    )
+
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.bind(("127.0.0.1", 0))
+        port = s.getsockname()[1]
+
+    mp_spawn.spawn(_rank0_broadcast_worker, args=(2, port, str(ckpt_file)), nprocs=2, join=True)
+

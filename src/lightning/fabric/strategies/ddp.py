@@ -21,6 +21,7 @@ from lightning_utilities.core.rank_zero import rank_zero_only as utils_rank_zero
 from torch import Tensor
 from torch.nn import Module
 from torch.nn.parallel.distributed import DistributedDataParallel
+from torch.optim import Optimizer
 from typing_extensions import override
 
 from lightning.fabric.accelerators.accelerator import Accelerator
@@ -30,9 +31,19 @@ from lightning.fabric.plugins.io.checkpoint_io import CheckpointIO
 from lightning.fabric.plugins.precision import Precision
 from lightning.fabric.strategies.launchers.multiprocessing import _MultiProcessingLauncher
 from lightning.fabric.strategies.launchers.subprocess_script import _SubprocessScriptLauncher
+from lightning.fabric.strategies.model_parallel import _load_raw_module_state
 from lightning.fabric.strategies.parallel import ParallelStrategy
 from lightning.fabric.strategies.registry import _StrategyRegistry
-from lightning.fabric.strategies.strategy import TBroadcast, _BackwardSyncControl
+from lightning.fabric.strategies.strategy import (
+    TBroadcast,
+    _BackwardSyncControl,
+    _validate_keys_for_strict_loading,
+)
+from lightning.fabric.utilities.cloud_io import (
+    _broadcast_optimizer_state_dict_rank0,
+    _is_dist_multi_rank,
+    _load_dist_checkpoint_rank0,
+)
 from lightning.fabric.utilities.distributed import (
     ReduceOp,
     _distributed_is_initialized,
@@ -42,6 +53,7 @@ from lightning.fabric.utilities.distributed import (
 )
 from lightning.fabric.utilities.distributed import group as _group
 from lightning.fabric.utilities.rank_zero import rank_zero_only
+from lightning.fabric.utilities.types import _PATH, _Stateful
 
 _DDP_FORK_ALIASES = (
     "ddp_fork",
@@ -204,7 +216,51 @@ class DDPStrategy(ParallelStrategy):
     ) -> None:
         if isinstance(module, DistributedDataParallel):
             module = module.module
-        super().load_module_state_dict(module=module, state_dict=state_dict, strict=strict)
+        _load_raw_module_state(state_dict=state_dict, module=module, world_size=self.world_size, strict=strict)
+
+    @override
+    def load_checkpoint(
+        self,
+        path: _PATH,
+        state: Optional[Union[Module, Optimizer, dict[str, Union[Module, Optimizer, Any]]]] = None,
+        strict: bool = True,
+        weights_only: Optional[bool] = None,
+    ) -> dict[str, Any]:
+        if not state or not _is_dist_multi_rank():
+            return super().load_checkpoint(path=path, state=state, strict=strict, weights_only=weights_only)
+
+        torch.cuda.empty_cache()
+        tensor_keys = (
+            tuple(k for k, v in state.items() if isinstance(v, (Module, Optimizer)))
+            if isinstance(state, dict)
+            else ()
+        )
+        checkpoint = _load_dist_checkpoint_rank0(
+            lambda: self.checkpoint_io.load_checkpoint(path, weights_only=weights_only),
+            tensor_keys=tensor_keys,
+        )
+
+        if isinstance(state, Module):
+            self.load_module_state_dict(module=state, state_dict=checkpoint, strict=strict)
+            return {}
+
+        if isinstance(state, Optimizer):
+            _broadcast_optimizer_state_dict_rank0(state, checkpoint, self.root_device)
+            return {}
+
+        _validate_keys_for_strict_loading(state.keys(), checkpoint.keys(), strict=strict)
+        for name, obj in state.copy().items():
+            if name not in checkpoint:
+                continue
+            if isinstance(obj, Module):
+                self.load_module_state_dict(module=obj, state_dict=checkpoint.pop(name), strict=strict)
+            elif isinstance(obj, Optimizer):
+                _broadcast_optimizer_state_dict_rank0(obj, checkpoint.pop(name), self.root_device)
+            elif isinstance(obj, _Stateful):
+                obj.load_state_dict(checkpoint.pop(name))
+            else:
+                state[name] = checkpoint.pop(name)
+        return checkpoint
 
     @classmethod
     @override

@@ -30,6 +30,7 @@ from lightning.fabric.strategies.fsdp import (
     _distributed_checkpoint_load,
     _distributed_checkpoint_save,
     _get_full_state_dict_context,
+    _has_fsdp_modules,
     _is_full_checkpoint,
     _is_sharded_checkpoint,
 )
@@ -43,10 +44,12 @@ from lightning.fabric.strategies.strategy import (
 )
 from lightning.fabric.utilities.cloud_io import (
     _atomic_save,
+    _broadcast_tensors_bucketed,
     _checkpoint_join,
     _is_checkpoint_dir,
     _is_local_file_protocol,
     _load,
+    _load_dist_checkpoint_rank0,
     _prepare_directory_checkpoint,
     _remove_checkpoint,
     _resolve_path,
@@ -472,10 +475,15 @@ def _load_checkpoint(
 
     if _is_full_checkpoint(path):
         weights_only = False if weights_only is None else weights_only
-        if _is_local_file_protocol(str(path)):
-            checkpoint = torch.load(path, mmap=True, map_location="cpu", weights_only=weights_only)
-        else:
-            checkpoint = _load(path, map_location="cpu", weights_only=weights_only)
+        tensor_keys = tuple(modules.keys()) + tuple(optimizers.keys()) + ("state_dict", "optimizer_states")
+        checkpoint = _load_dist_checkpoint_rank0(
+            lambda: (
+                torch.load(path, mmap=True, map_location="cpu", weights_only=weights_only)
+                if _is_local_file_protocol(str(path))
+                else _load(path, map_location="cpu", weights_only=weights_only)
+            ),
+            tensor_keys=tensor_keys,
+        )
         _load_raw_module_state(checkpoint.pop(module_key), module, strict=strict)
 
         state_dict_options = StateDictOptions(
@@ -492,12 +500,22 @@ def _load_checkpoint(
                 optimizer_state = checkpoint.pop(optimizer_name)
 
             optimizer_state = _rekey_optimizer_state_if_needed(optimizer_state, module)
-            set_optimizer_state_dict(
-                module,
-                optimizer,
-                optim_state_dict=optimizer_state,
-                options=state_dict_options,
-            )
+            orig_foreach = [pg.get("foreach") for pg in optimizer.param_groups]
+            for pg in optimizer.param_groups:
+                pg["foreach"] = False
+            try:
+                set_optimizer_state_dict(
+                    module,
+                    optimizer,
+                    optim_state_dict=optimizer_state,
+                    options=state_dict_options,
+                )
+            finally:
+                for pg, val in zip(optimizer.param_groups, orig_foreach):
+                    if val is None:
+                        pg.pop("foreach", None)
+                    else:
+                        pg["foreach"] = val
 
         requested_metadata_keys = state.keys() - modules.keys() - optimizers.keys()
         _validate_keys_for_strict_loading(requested_metadata_keys, checkpoint.keys(), strict=strict)
@@ -548,48 +566,141 @@ def _load_raw_module_state_from_path(path: _PATH, module: Module, world_size: in
             "Failed to load checkpoint directly into the model. The given path must be a single file containing the"
             f" full state dict: {path}"
         )
-    if _is_local_file_protocol(str(path)):
-        # Use `mmap` to avoid storing a copy of the full checkpoint per rank
-        state_dict = torch.load(path, mmap=True, map_location="cpu")
-    else:
-        state_dict = _load(path, map_location="cpu")
+    state_dict = _load_dist_checkpoint_rank0(
+        lambda: (
+            torch.load(path, mmap=True, map_location="cpu")
+            if _is_local_file_protocol(str(path))
+            else _load(path, map_location="cpu")
+        ),
+        tensor_keys=(),
+    )
     _load_raw_module_state(state_dict=state_dict, module=module, world_size=world_size, strict=strict)
+
+
+def _iter_direct_submodules_of_fsdp_unit(
+    mod: Module, prefix: str = "", is_root_fsdp: bool = True
+) -> Generator[tuple[str, Module], None, None]:
+    from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+
+    if not is_root_fsdp and isinstance(mod, FSDP):
+        return
+    yield prefix, mod
+    for child_name, child_mod in mod.named_children():
+        if child_name == "_fsdp_wrapped_module":
+            child_prefix = prefix
+        else:
+            child_prefix = f"{prefix}.{child_name}" if prefix else child_name
+        yield from _iter_direct_submodules_of_fsdp_unit(child_mod, prefix=child_prefix, is_root_fsdp=False)
 
 
 def _load_raw_module_state(
     state_dict: dict[str, Any], module: Module, world_size: int = 1, strict: bool = True
 ) -> None:
-    """Loads the state dict into the module by gathering all weights first and then and writing back to each shard."""
+    """Loads the state dict into the module by broadcasting from rank 0 and writing back to each shard."""
+    from lightning.fabric.utilities.cloud_io import _is_dist_multi_rank
     from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+    from torch.nn.parallel import DistributedDataParallel
+
+    is_dist_multi_rank = _is_dist_multi_rank()
+
+    if is_dist_multi_rank:
+        key_list = [set(state_dict.keys()) if torch.distributed.get_rank() == 0 else set()]
+        torch.distributed.broadcast_object_list(key_list, src=0)
+        present_keys: Any = key_list[0]
+    else:
+        present_keys = state_dict
 
     if _has_dtensor_modules(module):
         from torch.distributed.checkpoint.state_dict import StateDictOptions, set_model_state_dict
 
-        state_dict_options = StateDictOptions(
-            broadcast_from_rank0=True,
-            full_state_dict=True,
-            # must be set False to allow loading each param separately below
-            strict=False,
-        )
-
         for submodule_name, submodule in module.named_modules():
             for param_name, _ in _named_parameters_and_buffers_to_load(submodule):
                 full_param_name = f"{submodule_name}{'.' if submodule_name else ''}{param_name}"
-                if full_param_name not in state_dict:
-                    if not strict:
-                        continue
+                if full_param_name not in present_keys and strict:
                     raise KeyError(
                         f"The model contains a key '{full_param_name}' that does not exist in the loaded checkpoint."
                         " To disable strict loading, set `strict=False`."
                     )
-                local_state_dict = {param_name: state_dict[full_param_name]}
-                set_model_state_dict(submodule, local_state_dict, options=state_dict_options)
 
-    elif isinstance(module, FSDP):
-        with _get_full_state_dict_context(module, world_size=world_size, rank0_only=False):
-            module.load_state_dict(state_dict, strict=strict)
+        state_dict_options = StateDictOptions(
+            broadcast_from_rank0=True,
+            full_state_dict=True,
+            strict=False,
+        )
+        set_model_state_dict(module, state_dict, options=state_dict_options)
+
+    elif _has_fsdp_modules(module):
+        if not is_dist_multi_rank:
+            with _get_full_state_dict_context(module, world_size=world_size, rank0_only=False):
+                module.load_state_dict(state_dict, strict=strict)
+            return
+
+        expected_keys: set[str] = set()
+
+        def _collect_and_broadcast_unit(root_mod: Module, root_prefix: str) -> None:
+            unit_tensors: list[torch.Tensor] = []
+            seen_ptrs: set[int] = set()
+            for sub_prefix, submod in _iter_direct_submodules_of_fsdp_unit(
+                root_mod, prefix=root_prefix, is_root_fsdp=True
+            ):
+                for param_name, param_or_buf in _named_parameters_and_buffers_to_load(submod):
+                    clean_key = f"{sub_prefix}.{param_name}" if sub_prefix else param_name
+                    expected_keys.add(clean_key)
+                    if clean_key not in present_keys:
+                        if strict:
+                            raise KeyError(
+                                f"The model contains a key '{clean_key}' that does not exist in the loaded"
+                                " checkpoint. To disable strict loading, set `strict=False`."
+                            )
+                        continue
+                    if torch.distributed.get_rank() == 0:
+                        src_tensor = state_dict.pop(clean_key)
+                        param_or_buf.detach().copy_(src_tensor)
+                    if param_or_buf.data_ptr() not in seen_ptrs:
+                        seen_ptrs.add(param_or_buf.data_ptr())
+                        unit_tensors.append(param_or_buf.detach())
+            _broadcast_tensors_bucketed(unit_tensors)
+
+        if not isinstance(module, FSDP):
+            _collect_and_broadcast_unit(module, "")
+
+        for fsdp_name, fsdp_mod in module.named_modules():
+            if not isinstance(fsdp_mod, FSDP):
+                continue
+            clean_fsdp_prefix = ".".join(p for p in fsdp_name.split(".") if p and p != "_fsdp_wrapped_module")
+            with FSDP.summon_full_params(fsdp_mod, recurse=False, writeback=True):
+                _collect_and_broadcast_unit(fsdp_mod, clean_fsdp_prefix)
+
+        if strict and (unexpected_keys := present_keys - expected_keys):
+            raise RuntimeError(
+                f"Error(s) in loading state_dict for {module.__class__.__name__}:\n\t"
+                f"Unexpected key(s) in state_dict: {', '.join(repr(k) for k in sorted(unexpected_keys))}."
+            )
     else:
-        module.load_state_dict(state_dict, strict=strict)
+        raw_mod = module.module if isinstance(module, DistributedDataParallel) else module
+        if not is_dist_multi_rank:
+            raw_mod.load_state_dict(state_dict, strict=strict)
+            return
+
+        err_list: list[Optional[Exception]] = [None]
+        if torch.distributed.get_rank() == 0:
+            try:
+                raw_mod.load_state_dict(state_dict, strict=strict)
+                state_dict.clear()
+            except Exception as ex:
+                err_list[0] = ex
+        torch.distributed.broadcast_object_list(err_list, src=0)
+        if err_list[0] is not None:
+            raise err_list[0]
+
+        tensors_to_broadcast: list[torch.Tensor] = []
+        seen_ptrs: set[int] = set()
+        for _, submod in raw_mod.named_modules():
+            for _, param_or_buf in _named_parameters_and_buffers_to_load(submod):
+                if param_or_buf.data_ptr() not in seen_ptrs:
+                    seen_ptrs.add(param_or_buf.data_ptr())
+                    tensors_to_broadcast.append(param_or_buf.detach())
+        _broadcast_tensors_bucketed(tensors_to_broadcast)
 
 
 def _named_parameters_and_buffers_to_load(module: Module) -> Generator:
@@ -598,7 +709,7 @@ def _named_parameters_and_buffers_to_load(module: Module) -> Generator:
         module.named_buffers(recurse=False),
         module.named_parameters(recurse=False),
     ):
-        if param_name in module._non_persistent_buffers_set:
+        if param_name in module._non_persistent_buffers_set or param_name == "_flat_param":
             continue
         yield param_name, param
 
@@ -609,6 +720,31 @@ def _rekey_optimizer_state_if_needed(optimizer_state_dict: dict[str, Any], modul
     from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
     from torch.distributed.fsdp import OptimStateKeyType
 
-    if isinstance(list(optimizer_state_dict["state"].keys())[0], int):
-        optimizer_state_dict = FSDP.rekey_optim_state_dict(optimizer_state_dict, OptimStateKeyType.PARAM_NAME, module)
+    if not optimizer_state_dict:
+        return optimizer_state_dict
+    state_keys = list(optimizer_state_dict.get("state", {}).keys())
+    if state_keys:
+        needs_rekey = isinstance(state_keys[0], int)
+    else:
+        param_groups = optimizer_state_dict.get("param_groups", [])
+        needs_rekey = bool(
+            param_groups and param_groups[0].get("params") and isinstance(param_groups[0]["params"][0], int)
+        )
+    if needs_rekey:
+        try:
+            optimizer_state_dict = FSDP.rekey_optim_state_dict(
+                optimizer_state_dict, OptimStateKeyType.PARAM_NAME, module
+            )
+        except RuntimeError:
+            import copy
+            from torch.distributed.fsdp._common_utils import _get_param_to_fqns
+
+            param_id_to_name = [name for names in _get_param_to_fqns(module).values() for name in names]
+            new_osd: dict[str, Any] = {
+                "state": {param_id_to_name[pid]: pstate for pid, pstate in optimizer_state_dict["state"].items()},
+                "param_groups": copy.deepcopy(optimizer_state_dict["param_groups"]),
+            }
+            for pg in new_osd["param_groups"]:
+                pg["params"] = sorted(param_id_to_name[pid] for pid in pg["params"])
+            optimizer_state_dict = new_osd
     return optimizer_state_dict

@@ -14,7 +14,7 @@
 import logging
 from contextlib import nullcontext
 from datetime import timedelta
-from typing import TYPE_CHECKING, Any, Callable, Literal, Optional, Union
+from typing import TYPE_CHECKING, Any, Callable, Literal, Mapping, Optional, Union
 
 import torch
 import torch.distributed
@@ -29,6 +29,11 @@ import lightning.pytorch as pl
 from lightning.fabric.plugins import CheckpointIO, ClusterEnvironment
 from lightning.fabric.plugins.collectives.torch_collective import default_pg_timeout
 from lightning.fabric.strategies import _StrategyRegistry
+from lightning.fabric.strategies.model_parallel import _load_raw_module_state
+from lightning.fabric.utilities.cloud_io import (
+    _broadcast_optimizer_state_dict_rank0,
+    _load_dist_checkpoint_rank0,
+)
 from lightning.fabric.utilities.distributed import (
     _distributed_is_initialized,
     _get_default_process_group_backend_for_device,
@@ -39,7 +44,7 @@ from lightning.fabric.utilities.distributed import group as _group
 from lightning.fabric.utilities.imports import _IS_WINDOWS
 from lightning.fabric.utilities.optimizer import _optimizers_to_device
 from lightning.fabric.utilities.seed import reset_seed
-from lightning.fabric.utilities.types import ReduceOp
+from lightning.fabric.utilities.types import _PATH, ReduceOp
 from lightning.pytorch.core.optimizer import LightningOptimizer
 from lightning.pytorch.overrides.distributed import _register_ddp_comm_hook, _sync_module_states, prepare_for_backward
 from lightning.pytorch.plugins.precision import Precision
@@ -456,6 +461,35 @@ class DDPStrategy(ParallelStrategy):
             self.model = self._layer_sync.revert(self.model)
 
         super().teardown()
+
+    @override
+    def load_checkpoint(self, checkpoint_path: _PATH, weights_only: Optional[bool] = None) -> dict[str, Any]:
+        torch.cuda.empty_cache()
+        return _load_dist_checkpoint_rank0(
+            lambda: self.checkpoint_io.load_checkpoint(checkpoint_path, weights_only=weights_only),
+            tensor_keys=("state_dict", "optimizer_states"),
+        )
+
+    @override
+    def load_model_state_dict(self, checkpoint: Mapping[str, Any], strict: bool = True) -> None:
+        assert self.lightning_module is not None
+        _load_raw_module_state(
+            checkpoint["state_dict"],
+            module=self.lightning_module,
+            world_size=self.world_size,
+            strict=strict,
+        )
+
+    @override
+    def load_optimizer_state_dict(self, checkpoint: Mapping[str, Any]) -> None:
+        from lightning.fabric.utilities.cloud_io import _is_dist_multi_rank
+
+        optimizer_states = checkpoint["optimizer_states"]
+        if _is_dist_multi_rank():
+            for optimizer, opt_state in zip(self.optimizers, optimizer_states):
+                _broadcast_optimizer_state_dict_rank0(optimizer, opt_state, self.root_device)
+        else:
+            super().load_optimizer_state_dict(checkpoint)
 
 
 class _DDPForwardRedirection(_ForwardRedirection):
