@@ -23,6 +23,7 @@ import io
 import logging
 import os
 import shutil
+import stat
 import sys
 import tempfile
 import uuid
@@ -51,33 +52,170 @@ except ImportError:  # pragma: no cover
 # Streaming a small checkpoint straight from the object store beats paying for a local copy.
 _CACHE_MIN_SIZE_BYTES = 128 * 1024 * 1024
 _CACHE_DIR_PREFIX = "lightning_cache_"
+_CACHE_FILE_NAME = "checkpoint.ckpt"
+# Share of a cache root this user's checkpoints may occupy before the least recently used entries
+# are evicted. /dev/shm is RAM, so an unbounded cache would eventually starve the training process.
+_CACHE_BUDGET_FRACTION = 0.5
+_CACHE_ENABLED_ENV = "LIGHTNING_CHECKPOINT_CACHE"
+_CACHE_DIR_ENV = "LIGHTNING_CHECKPOINT_CACHE_DIR"
+_CACHE_MAX_BYTES_ENV = "LIGHTNING_CHECKPOINT_CACHE_MAX_BYTES"
+# Bounds the retry loop in `_entry_lock` in case a peer keeps recreating the lock file.
+_LOCK_ATTEMPTS = 8
+_O_NOFOLLOW = getattr(os, "O_NOFOLLOW", 0)
+
+
+def _cache_enabled() -> bool:
+    """Return whether remote checkpoints may be cached on the node."""
+    if not _HAS_FCNTL:  # pragma: no cover
+        # Without an advisory lock every rank downloads the same object and they race on
+        # `os.replace`, which fails on Windows while a peer still has the target open.
+        return False
+    return os.environ.get(_CACHE_ENABLED_ENV, "1").strip().lower() not in ("0", "false", "off", "no")
 
 
 @contextlib.contextmanager
-def _file_lock(lock_path: str) -> Iterator[None]:
-    """Acquire an exclusive node-local advisory file lock using stdlib ``fcntl.flock`` on POSIX."""
+def _entry_lock(lock_path: str, blocking: bool = True) -> Iterator[bool]:
+    """Hold the node-local advisory lock guarding one cache entry, using stdlib ``fcntl.flock``.
+
+    Yields whether the lock was taken; a non-blocking attempt yields ``False`` when another process
+    is already inside the entry. Reclamation may unlink a lock file while we wait on it, leaving us
+    holding an orphaned inode that guards nothing, so the locked inode is compared against the one
+    now at ``lock_path`` and the acquisition is retried if they differ.
+
+    """
     if not _HAS_FCNTL:  # pragma: no cover
-        yield
+        yield True
         return
-    fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+    fd: Optional[int] = None
     try:
-        fcntl.flock(fd, fcntl.LOCK_EX)
-        yield
-    finally:
-        with contextlib.suppress(OSError):
+        for _ in range(_LOCK_ATTEMPTS):
+            try:
+                fd = os.open(lock_path, os.O_CREAT | os.O_RDWR | _O_NOFOLLOW, 0o600)
+            except OSError as e:
+                log.debug(f"Cannot open the checkpoint cache lock {lock_path} ({e}).")
+                fd = None
+                break
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX if blocking else fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except OSError:
+                os.close(fd)
+                fd = None
+                break
+            with contextlib.suppress(OSError):
+                if os.stat(lock_path).st_ino == os.fstat(fd).st_ino:
+                    break
             fcntl.flock(fd, fcntl.LOCK_UN)
-        os.close(fd)
+            os.close(fd)
+            fd = None
+        yield fd is not None
+    finally:
+        if fd is not None:
+            with contextlib.suppress(OSError):
+                fcntl.flock(fd, fcntl.LOCK_UN)
+            os.close(fd)
+
+
+def _remove_cache_entry(cache_dir: str) -> None:
+    """Delete a cache entry and its lock, skipping it while another process is downloading into it."""
+    lock_path = f"{cache_dir}.lock"
+    with _entry_lock(lock_path, blocking=False) as locked:
+        if not locked:
+            log.debug(f"Not reclaiming {cache_dir}: another process is still using it.")
+            return
+        shutil.rmtree(cache_dir, ignore_errors=True)
+        with contextlib.suppress(OSError):
+            os.remove(lock_path)
 
 
 def _get_cache_roots() -> tuple[str, ...]:
     """Return candidate cache root directories in order of preference."""
+    override = os.environ.get(_CACHE_DIR_ENV)
+    if override:
+        return (override,)
     return ("/dev/shm", tempfile.gettempdir())
 
 
 def _user_cache_prefix() -> str:
     """Namespace cache directories by UID so multi-user nodes never collide in /dev/shm or /tmp."""
-    uid = str(os.getuid()) if hasattr(os, "getuid") else getpass.getuser()
-    return f"{_CACHE_DIR_PREFIX}{uid}_"
+    if hasattr(os, "getuid"):
+        return f"{_CACHE_DIR_PREFIX}{os.getuid()}_"
+    # `getpass.getuser()` can return "DOMAIN\\user", which is not a usable path component.
+    return f"{_CACHE_DIR_PREFIX}{hashlib.sha256(getpass.getuser().encode()).hexdigest()[:16]}_"
+
+
+def _is_private_dir(path: str) -> bool:
+    """Return whether ``path`` is a real directory owned by us that nobody else can write to.
+
+    ``/dev/shm`` and ``/tmp`` are world-writable, so another local user can pre-create the entry (or
+    a symlink standing in for it) and swap the checkpoint before we unpickle it.
+
+    """
+    try:
+        info = os.lstat(path)
+    except OSError:
+        return False
+    if not stat.S_ISDIR(info.st_mode) or info.st_mode & 0o022:
+        return False
+    return not hasattr(os, "getuid") or info.st_uid == os.getuid()
+
+
+def _cache_entries(root: str) -> Iterator[str]:
+    """Yield this user's cache entry directories in ``root``, with any ``.lock`` suffix stripped."""
+    seen = set()
+    for match in glob.glob(os.path.join(root, f"{_user_cache_prefix()}*")):
+        entry = match[: -len(".lock")] if match.endswith(".lock") else match
+        if entry not in seen:
+            seen.add(entry)
+            yield entry
+
+
+def _entry_size(cache_dir: str) -> int:
+    total = 0
+    for dirpath, _, filenames in os.walk(cache_dir):
+        for name in filenames:
+            with contextlib.suppress(OSError):
+                total += os.path.getsize(os.path.join(dirpath, name))
+    return total
+
+
+def _cache_budget(root: str) -> Optional[int]:
+    """Return how many bytes this user's cache may occupy in ``root``, or ``None`` if unknown."""
+    override = os.environ.get(_CACHE_MAX_BYTES_ENV)
+    if override:
+        try:
+            return max(0, int(override))
+        except ValueError:
+            log.warning(f"Ignoring non-integer {_CACHE_MAX_BYTES_ENV}={override!r}.")
+    try:
+        return int(shutil.disk_usage(root).total * _CACHE_BUDGET_FRACTION)
+    except OSError:
+        return None
+
+
+def _evict_cache_entries(root: str, keep: str, incoming: int) -> None:
+    """Evict least recently used entries until ``incoming`` extra bytes fit within ``root``'s budget."""
+    budget = _cache_budget(root)
+    if budget is None:
+        return
+    keep_abs = os.path.abspath(keep)
+    total = 0
+    evictable = []
+    for entry in _cache_entries(root):
+        size = _entry_size(entry)
+        total += size
+        if os.path.abspath(entry) == keep_abs:
+            continue
+        try:
+            # `_load` touches an entry whenever it uses it, so mtime orders them by last use.
+            evictable.append((os.path.getmtime(entry), entry, size))
+        except OSError:
+            continue
+    for _, entry, size in sorted(evictable):
+        if total + incoming <= budget:
+            return
+        _remove_cache_entry(entry)
+        if not os.path.exists(entry):
+            total -= size
 
 
 def _torch_load(
@@ -94,7 +232,7 @@ def _torch_load(
                 weights_only=weights_only,
                 mmap=True,
             )
-        except RuntimeError as e:
+        except (RuntimeError, ValueError) as e:
             if "mmap" not in str(e):
                 raise
             log.debug(f"Checkpoint {path} cannot be memory-mapped ({e}); loading it normally.")
@@ -106,37 +244,68 @@ def _torch_load(
 
 
 def _remote_version(file_info: dict[str, Any]) -> str:
-    """Return a token that changes whenever the remote object's content changes."""
-    for key in ("etag", "ETag", "generation", "version_id", "mtime", "LastModified", "last_modified"):
+    """Return a token that changes whenever the remote object's content changes.
+
+    Only strong validators are accepted. A modification time is too coarse to key a cache on: an
+    overwrite within the same second that keeps the size is indistinguishable from the original, so
+    the stale weights would be served. Objects without one are streamed instead of cached.
+
+    """
+    for key in ("etag", "ETag", "generation", "version_id", "VersionId"):
         value = file_info.get(key)
         if value is not None and str(value) != "":
             return str(value)
     return ""
 
 
+def _cached_file_is_complete(path: str, remote_size: int) -> bool:
+    """Return whether ``path`` holds a fully downloaded copy of an object of ``remote_size`` bytes.
+
+    Only a short file indicates a partial download. Objects served with ``Content-Encoding: gzip``
+    decode to more bytes than ``fs.info`` reports, and they must not be re-downloaded on every load.
+
+    """
+    try:
+        return os.path.getsize(path) >= remote_size
+    except OSError:
+        return False
+
+
 def _reclaim_superseded_entries(path_digest: str, keep: str) -> None:
     """Delete older cache entries for the same remote path across candidate roots."""
-    prefix = f"{_user_cache_prefix()}{path_digest}_"
     keep_abs = os.path.abspath(keep)
     for root in _get_cache_roots():
-        for stale in glob.glob(os.path.join(root, f"{prefix}*")):
-            if stale.endswith(".lock") or os.path.abspath(stale) == keep_abs:
-                continue
-            shutil.rmtree(stale, ignore_errors=True)
-            with contextlib.suppress(OSError):
-                os.remove(f"{stale}.lock")
+        for stale in _cache_entries(root):
+            if os.path.basename(stale).startswith(f"{_user_cache_prefix()}{path_digest}_") and (
+                os.path.abspath(stale) != keep_abs
+            ):
+                _remove_cache_entry(stale)
 
 
 def clear_cache() -> None:
-    """Remove every local checkpoint cache entry written by :func:`_load` for the current user."""
-    prefix = _user_cache_prefix()
+    """Remove every local checkpoint cache entry written by :func:`_load` for the current user.
+
+    Entries that another process is currently downloading into are left alone.
+
+    """
     for root in _get_cache_roots():
-        for entry in glob.glob(os.path.join(root, f"{prefix}*")):
-            if entry.endswith(".lock"):
-                with contextlib.suppress(OSError):
-                    os.remove(entry)
-            else:
-                shutil.rmtree(entry, ignore_errors=True)
+        for entry in _cache_entries(root):
+            _remove_cache_entry(entry)
+
+
+def _stream_load(
+    fs: AbstractFileSystem,
+    path: str,
+    map_location: _MAP_LOCATION_TYPE,
+    weights_only: Optional[bool],
+) -> Any:
+    """Load a checkpoint straight off the remote filesystem, without a local copy."""
+    with fs.open(path, "rb") as f:
+        return torch.load(
+            f,
+            map_location=map_location,  # type: ignore[arg-type]
+            weights_only=weights_only,
+        )
 
 
 def _load(
@@ -183,92 +352,116 @@ def _load(
 
     # 1. Local path optimization: no copy is needed, map the file directly.
     if _is_local_file_protocol(path_str):
-        return _torch_load(fs._strip_protocol(path_str), map_location, weights_only)
+        _, local_file = url_to_fs(path_str)
+        return _torch_load(local_file, map_location, weights_only)
 
     # 2. Remote checkpoint fetching via stdlib fcntl.flock + fs.get_file
+    if not _cache_enabled():
+        return _stream_load(fs, path_str, map_location, weights_only)
+
     try:
         file_info = fs.info(path_str)
         raw_size = file_info.get("size")
         file_size = int(raw_size) if raw_size is not None else 0
-    except Exception:
+    except Exception as e:
+        log.debug(f"Cannot stat {path_str} ({e}); streaming it rather than caching it locally.")
         file_info = {}
         file_size = 0
 
-    version = _remote_version(file_info)
+    # Stream small files: a local copy costs more than it saves.
+    if file_size < _CACHE_MIN_SIZE_BYTES:
+        return _stream_load(fs, path_str, map_location, weights_only)
 
-    # Fall back to streaming for small files, unknown size, or a backend that exposes no version
-    # token. Caching on size alone would serve stale bytes for an overwritten checkpoint.
-    if file_size < _CACHE_MIN_SIZE_BYTES or not version:
-        if file_size >= _CACHE_MIN_SIZE_BYTES:
-            log.debug(
-                f"{path_str} exposes no version token (etag/generation/mtime), so it is streamed"
-                f" rather than cached locally."
-            )
-        with fs.open(path_str, "rb") as f:
-            return torch.load(
-                f,
-                map_location=map_location,  # type: ignore[arg-type]
-                weights_only=weights_only,
-            )
+    # Without a version token the cache cannot be invalidated, and caching on size alone would
+    # serve stale bytes for an overwritten checkpoint.
+    version = _remote_version(file_info)
+    if not version:
+        log.debug(
+            f"{path_str} exposes no version token (etag/generation/version_id), so it is streamed"
+            f" rather than cached locally."
+        )
+        return _stream_load(fs, path_str, map_location, weights_only)
 
     path_digest = hashlib.sha256(path_str.encode()).hexdigest()[:16]
     version_digest = hashlib.sha256(f"{version}:{file_size}".encode()).hexdigest()[:16]
     cache_subdir = f"{_user_cache_prefix()}{path_digest}_{version_digest}"
+    roots = _get_cache_roots()
 
-    # Check if already cached or actively being downloaded in any candidate root before checking free space.
+    # Prefer a root that already holds the entry, or that a peer rank is downloading into, so that
+    # everyone converges on a single copy instead of racing to fill two roots.
     selected_root: Optional[str] = None
-    for root in _get_cache_roots():
+    for root in roots:
         candidate_dir = os.path.join(root, cache_subdir)
-        candidate = os.path.join(candidate_dir, "checkpoint.ckpt")
-        if (os.path.exists(candidate) and os.path.getsize(candidate) == file_size) or os.path.exists(
+        if _cached_file_is_complete(os.path.join(candidate_dir, _CACHE_FILE_NAME), file_size) or os.path.exists(
             f"{candidate_dir}.lock"
         ):
             selected_root = root
             break
 
     if selected_root is None:
-        roots = _get_cache_roots()
-        shm_dir = roots[0] if roots else "/dev/shm"
-        has_shm = os.path.exists(shm_dir) and os.access(shm_dir, os.W_OK)
-        if has_shm:
+        for root in roots:
+            if not (os.path.isdir(root) and os.access(root, os.W_OK)):
+                continue
+            _evict_cache_entries(root, os.path.join(root, cache_subdir), file_size)
             try:
-                if shutil.disk_usage(shm_dir).free < file_size * 1.5:
-                    has_shm = False
+                # Headroom on top of the payload itself: peer ranks on the node may be staging
+                # their own checkpoints into the same root at the same time.
+                if shutil.disk_usage(root).free < file_size * 1.5:
+                    continue
             except OSError:
-                has_shm = False
-        selected_root = shm_dir if has_shm else (roots[-1] if roots else tempfile.gettempdir())
+                continue
+            selected_root = root
+            break
+
+    if selected_root is None:
+        log.warning(f"No cache root has room for {path_str} ({file_size} bytes); streaming it instead.")
+        return _stream_load(fs, path_str, map_location, weights_only)
 
     cache_dir = os.path.join(selected_root, cache_subdir)
-    os.makedirs(cache_dir, mode=0o700, exist_ok=True)
-    with contextlib.suppress(OSError):
+    try:
+        os.makedirs(cache_dir, mode=0o700, exist_ok=True)
         os.chmod(cache_dir, 0o700)
+    except OSError as e:
+        log.warning(f"Cannot prepare the checkpoint cache directory {cache_dir} ({e}); streaming instead.")
+        return _stream_load(fs, path_str, map_location, weights_only)
 
-    local_path = os.path.join(cache_dir, "checkpoint.ckpt")
+    if not _is_private_dir(cache_dir):
+        log.warning(
+            f"Refusing to cache {path_str} in {cache_dir}: it is not a directory owned exclusively by this"
+            f" user, so its contents cannot be trusted. Streaming the checkpoint instead."
+        )
+        return _stream_load(fs, path_str, map_location, weights_only)
+
+    local_path = os.path.join(cache_dir, _CACHE_FILE_NAME)
     lock_path = f"{cache_dir}.lock"
-    staging_path = os.path.join(cache_dir, f"checkpoint.ckpt.tmp.{os.getpid()}.{uuid.uuid4().hex[:8]}")
+    staging_path = os.path.join(cache_dir, f"{_CACHE_FILE_NAME}.tmp.{os.getpid()}.{uuid.uuid4().hex[:8]}")
 
     downloaded = False
-    with _file_lock(lock_path):
-        if not os.path.exists(local_path) or os.path.getsize(local_path) != file_size:
+    with _entry_lock(lock_path) as locked:
+        if not locked:  # pragma: no cover
+            log.warning(f"Cannot lock the checkpoint cache entry {cache_dir}; streaming instead.")
+            return _stream_load(fs, path_str, map_location, weights_only)
+
+        if not _cached_file_is_complete(local_path, file_size):
             size_gb = file_size / (1024**3)
             log.info(f"Fetching {path_str} ({size_gb:.2f} GB) to {staging_path}...")
 
             try:
                 fs.get_file(path_str, staging_path)
                 staged_size = os.path.getsize(staging_path)
-                if staged_size != file_size:
+                if staged_size < file_size:
                     raise OSError(f"Truncated download of {path_str}: expected {file_size} bytes, got {staged_size}")
                 os.chmod(staging_path, 0o600)
                 os.replace(staging_path, local_path)
                 downloaded = True
-            except BaseException:
-                with contextlib.suppress(OSError):
-                    os.remove(lock_path)
-                raise
             finally:
+                # Only ever remove our own staging file, never the promoted checkpoint.
                 with contextlib.suppress(OSError):
-                    if os.path.exists(staging_path):
-                        os.remove(staging_path)
+                    os.remove(staging_path)
+
+        # Keep LRU eviction from reclaiming an entry that is still in active use.
+        with contextlib.suppress(OSError):
+            os.utime(cache_dir)
 
     if downloaded:
         _reclaim_superseded_entries(path_digest, cache_dir)

@@ -29,6 +29,7 @@ import torch
 from fsspec.implementations.local import LocalFileSystem
 from fsspec.spec import AbstractFileSystem
 
+from lightning.fabric.utilities import cloud_io
 from lightning.fabric.utilities.cloud_io import (
     _atomic_save,
     _checkpoint_join,
@@ -36,12 +37,15 @@ from lightning.fabric.utilities.cloud_io import (
     _is_dir,
     _load,
     _prepare_directory_checkpoint,
+    _remote_version,
     _remove_checkpoint,
     _resolve_path,
     _user_cache_prefix,
     clear_cache,
     get_filesystem,
 )
+
+_requires_cache = pytest.mark.skipif(not cloud_io._HAS_FCNTL, reason="the node-local checkpoint cache requires `fcntl`")
 
 
 def test_get_filesystem_custom_filesystem():
@@ -370,6 +374,8 @@ def _versioned_fs(src, size, version="v1", calls=None):
 
 def _use_tmp_cache_root(tmp_path, monkeypatch):
     """Route all cache roots into `tmp_path` and lower the size threshold for fast unit tests."""
+    if not cloud_io._HAS_FCNTL:  # pragma: no cover
+        pytest.skip("the node-local checkpoint cache requires `fcntl`")
     monkeypatch.setattr("lightning.fabric.utilities.cloud_io._CACHE_MIN_SIZE_BYTES", 1024)
     monkeypatch.setattr("lightning.fabric.utilities.cloud_io._is_local_file_protocol", lambda _: False)
     monkeypatch.setattr("lightning.fabric.utilities.cloud_io._get_cache_roots", lambda: (str(tmp_path),))
@@ -774,3 +780,220 @@ def test_load_remote_multiprocess_singleflight(tmp_path):
 
     assert [p.exitcode for p in procs] == [0] * nprocs
     assert len(list(counter_dir.glob("call.*"))) == 1
+
+
+def test_remote_version_requires_a_strong_validator():
+    """A modification time is too coarse to invalidate a cache on, so it must not be accepted."""
+    assert _remote_version({"etag": "abc"}) == "abc"
+    assert _remote_version({"generation": 0}) == "0"
+    assert _remote_version({"version_id": "v7"}) == "v7"
+    assert _remote_version({"mtime": 1700000000, "LastModified": "now", "size": 1}) == ""
+
+
+@_requires_cache
+def test_cache_can_be_disabled_by_env(tmp_path, monkeypatch):
+    ckpt_path = tmp_path / "opt_out.ckpt"
+    size = _big_checkpoint(ckpt_path)
+
+    _use_tmp_cache_root(tmp_path, monkeypatch)
+    monkeypatch.setenv("LIGHTNING_CHECKPOINT_CACHE", "0")
+    calls = []
+    monkeypatch.setattr(
+        "lightning.fabric.utilities.cloud_io.get_filesystem",
+        lambda _: _versioned_fs(ckpt_path, size, calls=calls),
+    )
+
+    res = _load(str(ckpt_path), map_location="cpu")
+    assert res["weights"].shape == (4096,)
+    assert calls == [], "the checkpoint was cached even though the cache is disabled"
+    assert [d for d in os.listdir(tmp_path) if d.startswith(_user_cache_prefix())] == []
+
+
+@_requires_cache
+def test_cache_root_can_be_overridden_by_env(tmp_path, monkeypatch):
+    ckpt_path = tmp_path / "override.ckpt"
+    size = _big_checkpoint(ckpt_path)
+    cache_root = tmp_path / "custom_cache"
+    cache_root.mkdir()
+
+    monkeypatch.setattr("lightning.fabric.utilities.cloud_io._CACHE_MIN_SIZE_BYTES", 1024)
+    monkeypatch.setattr("lightning.fabric.utilities.cloud_io._is_local_file_protocol", lambda _: False)
+    monkeypatch.setenv("LIGHTNING_CHECKPOINT_CACHE_DIR", str(cache_root))
+    monkeypatch.setattr(
+        "lightning.fabric.utilities.cloud_io.get_filesystem",
+        lambda _: _versioned_fs(ckpt_path, size),
+    )
+
+    res = _load(str(ckpt_path), map_location="cpu")
+    assert res["weights"].shape == (4096,)
+    assert [d for d in os.listdir(cache_root) if d.startswith(_user_cache_prefix())]
+
+
+@_requires_cache
+def test_cache_evicts_least_recently_used_entries_over_budget(tmp_path, monkeypatch):
+    """/dev/shm is RAM, so the cache must stay within a budget rather than grow without bound."""
+    first = tmp_path / "a.ckpt"
+    second = tmp_path / "b.ckpt"
+    size = _big_checkpoint(first, fill=1.0)
+    _big_checkpoint(second, fill=2.0)
+    cache_root = tmp_path / "cache"
+    cache_root.mkdir()
+
+    monkeypatch.setattr("lightning.fabric.utilities.cloud_io._CACHE_MIN_SIZE_BYTES", 1024)
+    monkeypatch.setattr("lightning.fabric.utilities.cloud_io._is_local_file_protocol", lambda _: False)
+    monkeypatch.setattr("lightning.fabric.utilities.cloud_io._get_cache_roots", lambda: (str(cache_root),))
+    # Room for one checkpoint, not two.
+    monkeypatch.setenv("LIGHTNING_CHECKPOINT_CACHE_MAX_BYTES", str(int(size * 1.5)))
+
+    monkeypatch.setattr(
+        "lightning.fabric.utilities.cloud_io.get_filesystem",
+        lambda _: _versioned_fs(first, size),
+    )
+    assert torch.all(_load(str(first), map_location="cpu")["weights"] == 1.0)
+
+    monkeypatch.setattr(
+        "lightning.fabric.utilities.cloud_io.get_filesystem",
+        lambda _: _versioned_fs(second, size),
+    )
+    assert torch.all(_load(str(second), map_location="cpu")["weights"] == 2.0)
+
+    prefix = _user_cache_prefix()
+    entries = [d for d in os.listdir(cache_root) if d.startswith(prefix) and not d.endswith(".lock")]
+    assert len(entries) == 1, f"the cache grew past its budget: {entries}"
+
+
+@_requires_cache
+def test_reclamation_skips_an_entry_another_process_is_using(tmp_path, monkeypatch):
+    """Reclaiming an entry mid-download would delete a peer's staging file out from under it."""
+    import fcntl
+
+    ckpt_path = tmp_path / "busy.ckpt"
+    size = _big_checkpoint(ckpt_path)
+    _use_tmp_cache_root(tmp_path, monkeypatch)
+
+    monkeypatch.setattr(
+        "lightning.fabric.utilities.cloud_io.get_filesystem",
+        lambda _: _versioned_fs(ckpt_path, size, version="v1"),
+    )
+    _load(str(ckpt_path), map_location="cpu")
+
+    prefix = _user_cache_prefix()
+    entry = next(d for d in os.listdir(tmp_path) if d.startswith(prefix) and not d.endswith(".lock"))
+    old_dir = tmp_path / entry
+
+    # Take the lock the way a concurrent downloader on this node would.
+    fd = os.open(f"{old_dir}.lock", os.O_CREAT | os.O_RDWR, 0o600)
+    fcntl.flock(fd, fcntl.LOCK_EX)
+    try:
+        monkeypatch.setattr(
+            "lightning.fabric.utilities.cloud_io.get_filesystem",
+            lambda _: _versioned_fs(ckpt_path, size, version="v2"),
+        )
+        _load(str(ckpt_path), map_location="cpu")
+        assert old_dir.exists(), "reclamation deleted an entry another process was using"
+
+        clear_cache()
+        assert old_dir.exists(), "clear_cache deleted an entry another process was using"
+    finally:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        os.close(fd)
+
+    clear_cache()
+    assert not old_dir.exists()
+
+
+@_requires_cache
+def test_failed_download_keeps_the_lock_file(tmp_path, monkeypatch):
+    """Unlinking a lock we hold orphans the inode and lets two ranks download at once."""
+    ckpt_path = tmp_path / "boom.ckpt"
+    _use_tmp_cache_root(tmp_path, monkeypatch)
+
+    class FailingFS:
+        def info(self, path):
+            return {"size": 4096, "etag": "v1"}
+
+        def get_file(self, rpath, lpath):
+            raise RuntimeError("simulated download failure")
+
+    monkeypatch.setattr("lightning.fabric.utilities.cloud_io.get_filesystem", lambda _: FailingFS())
+
+    with pytest.raises(RuntimeError, match="simulated download failure"):
+        _load(str(ckpt_path), map_location="cpu")
+
+    prefix = _user_cache_prefix()
+    locks = [d for d in os.listdir(tmp_path) if d.startswith(prefix) and d.endswith(".lock")]
+    assert len(locks) == 1
+
+
+@_requires_cache
+def test_cache_dir_we_do_not_own_is_not_used(tmp_path, monkeypatch):
+    """/dev/shm is world-writable, so a pre-created entry could feed a swapped checkpoint to pickle."""
+    ckpt_path = tmp_path / "hijack.ckpt"
+    size = _big_checkpoint(ckpt_path)
+    _use_tmp_cache_root(tmp_path, monkeypatch)
+
+    path_digest = hashlib.sha256(str(ckpt_path).encode()).hexdigest()[:16]
+    version_digest = hashlib.sha256(f"v1:{size}".encode()).hexdigest()[:16]
+    cache_dir = tmp_path / f"{_user_cache_prefix()}{path_digest}_{version_digest}"
+
+    # Stand in for an attacker-planted symlink: `os.makedirs(exist_ok=True)` accepts it and the
+    # follow-up `chmod` resolves it, so only an `lstat` check catches it.
+    attacker_dir = tmp_path / "attacker"
+    attacker_dir.mkdir()
+    cache_dir.symlink_to(attacker_dir, target_is_directory=True)
+
+    calls = []
+    monkeypatch.setattr(
+        "lightning.fabric.utilities.cloud_io.get_filesystem",
+        lambda _: _versioned_fs(ckpt_path, size, calls=calls),
+    )
+
+    res = _load(str(ckpt_path), map_location="cpu")
+    assert res["weights"].shape == (4096,)
+    assert calls == [], "the checkpoint was written into a directory we do not exclusively own"
+    assert not (attacker_dir / "checkpoint.ckpt").exists()
+
+
+@_requires_cache
+def test_load_remote_streams_when_no_root_has_room(tmp_path, monkeypatch):
+    ckpt_path = tmp_path / "toobig.ckpt"
+    size = _big_checkpoint(ckpt_path)
+    _use_tmp_cache_root(tmp_path, monkeypatch)
+
+    calls = []
+    monkeypatch.setattr(
+        "lightning.fabric.utilities.cloud_io.get_filesystem",
+        lambda _: _versioned_fs(ckpt_path, size, calls=calls),
+    )
+    monkeypatch.setattr(shutil, "disk_usage", lambda _: SimpleNamespace(total=size * 20, used=size * 20, free=0))
+
+    res = _load(str(ckpt_path), map_location="cpu")
+    assert res["weights"].shape == (4096,)
+    assert calls == []
+    assert [d for d in os.listdir(tmp_path) if d.startswith(_user_cache_prefix())] == []
+
+
+@_requires_cache
+def test_decoded_file_larger_than_reported_size_is_a_cache_hit(tmp_path, monkeypatch):
+    """A gzip-transcoded object decodes to more bytes than `fs.info` reports."""
+    ckpt_path = tmp_path / "transcoded.ckpt"
+    size = _big_checkpoint(ckpt_path)
+    _use_tmp_cache_root(tmp_path, monkeypatch)
+
+    calls = []
+
+    class TranscodingFS:
+        def info(self, path):
+            # The object is stored compressed, so the reported size is smaller than what we get.
+            return {"size": size // 2, "etag": "v1"}
+
+        def get_file(self, rpath, lpath):
+            calls.append(rpath)
+            shutil.copyfile(ckpt_path, lpath)
+
+    monkeypatch.setattr("lightning.fabric.utilities.cloud_io.get_filesystem", lambda _: TranscodingFS())
+
+    assert _load(str(ckpt_path), map_location="cpu")["weights"].shape == (4096,)
+    assert len(calls) == 1
+    assert _load(str(ckpt_path), map_location="cpu")["weights"].shape == (4096,)
+    assert len(calls) == 1, "the decoded checkpoint was re-downloaded instead of being reused"

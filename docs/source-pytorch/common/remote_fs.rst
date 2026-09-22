@@ -40,15 +40,32 @@ Additionally, you could also resume training with a checkpoint stored at a remot
     When loading a remote checkpoint of 128 MB or larger, Lightning downloads it once into a
     node-local cache directory (preferring the ``/dev/shm`` RAM disk when it has enough free
     capacity, otherwise the system temporary directory) and then loads it with memory-mapping
-    (``mmap=True``). Ranks sharing a node elect a single downloader through a file lock, so the
-    object is fetched once and the resulting pages are shared by all of them.
+    (``mmap=True``). Ranks sharing a node elect a single downloader through a POSIX file lock, so
+    the object is fetched once and the resulting pages are shared by all of them. Platforms without
+    ``fcntl`` (Windows) stream the checkpoint instead.
 
     Cache entries are keyed on the remote object's version (``etag``, ``generation`` or
-    modification time), so overwriting a checkpoint at the same path invalidates the old entry
+    ``version_id``), so overwriting a checkpoint at the same path invalidates the old entry
     automatically and the superseded copy is reclaimed. If the backend reports no version
-    information, the checkpoint is streamed instead of cached. Entries deliberately outlive the
-    process so that later jobs on the same node reuse them; call
-    :func:`lightning.fabric.utilities.cloud_io.clear_cache` to release the space.
+    information, the checkpoint is streamed instead of cached.
+
+    Entries outlive the process so that later jobs on the same node reuse them. To keep the RAM
+    disk from filling up, the least recently used entries are evicted once this user's checkpoints
+    occupy more than half of the cache root; ``lightning.fabric.utilities.cloud_io.clear_cache()``
+    removes them all. Three environment variables control the behaviour:
+
+    .. list-table::
+        :widths: 40 60
+        :header-rows: 1
+
+        * - Variable
+          - Effect
+        * - ``LIGHTNING_CHECKPOINT_CACHE``
+          - Set to ``0`` to disable caching and always stream.
+        * - ``LIGHTNING_CHECKPOINT_CACHE_DIR``
+          - Use this directory instead of ``/dev/shm`` and the temporary directory.
+        * - ``LIGHTNING_CHECKPOINT_CACHE_MAX_BYTES``
+          - Byte budget per cache root, overriding the default half-of-capacity.
 
 PyTorch Lightning uses `fsspec <https://filesystem-spec.readthedocs.io/>`_ internally to handle all filesystem operations.
 
