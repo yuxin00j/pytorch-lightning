@@ -376,6 +376,12 @@ def _use_tmp_cache_root(tmp_path, monkeypatch):
     """Route all cache roots into `tmp_path` and lower the size threshold for fast unit tests."""
     if not cloud_io._HAS_FCNTL:  # pragma: no cover
         pytest.skip("the node-local checkpoint cache requires `fcntl`")
+    for var in (
+        "LIGHTNING_CHECKPOINT_CACHE",
+        "LIGHTNING_CHECKPOINT_CACHE_DIR",
+        "LIGHTNING_CHECKPOINT_CACHE_MAX_BYTES",
+    ):
+        monkeypatch.delenv(var, raising=False)
     monkeypatch.setattr("lightning.fabric.utilities.cloud_io._CACHE_MIN_SIZE_BYTES", 1024)
     monkeypatch.setattr("lightning.fabric.utilities.cloud_io._is_local_file_protocol", lambda _: False)
     monkeypatch.setattr("lightning.fabric.utilities.cloud_io._get_cache_roots", lambda: (str(tmp_path),))
@@ -996,3 +1002,149 @@ def test_decoded_file_larger_than_reported_size_is_a_cache_hit(tmp_path, monkeyp
     assert len(calls) == 1
     assert _load(str(ckpt_path), map_location="cpu")["weights"].shape == (4096,)
     assert len(calls) == 1, "the decoded checkpoint was re-downloaded instead of being reused"
+
+
+@_requires_cache
+def test_eviction_skips_root_when_budget_too_small_without_wiping_existing_entries(tmp_path, monkeypatch):
+    """Roots whose budget cannot hold the incoming checkpoint must not be wiped and must be skipped."""
+    small_root = tmp_path / "small_root"
+    big_root = tmp_path / "big_root"
+    small_root.mkdir()
+    big_root.mkdir()
+
+    existing_ckpt = tmp_path / "existing.ckpt"
+    existing_size = _big_checkpoint(existing_ckpt, fill=1.0)
+    existing_path_digest = hashlib.sha256(str(existing_ckpt).encode()).hexdigest()[:16]
+    existing_version_digest = hashlib.sha256(f"v1:{existing_size}".encode()).hexdigest()[:16]
+    existing_dir = small_root / f"{_user_cache_prefix()}{existing_path_digest}_{existing_version_digest}"
+    existing_dir.mkdir(parents=True)
+    (existing_dir / "checkpoint.ckpt").write_bytes(b"x" * existing_size)
+
+    incoming_ckpt = tmp_path / "incoming.ckpt"
+    incoming_size = _big_checkpoint(incoming_ckpt, fill=2.0)
+
+    _use_tmp_cache_root(tmp_path, monkeypatch)
+    roots_tuple = (str(small_root), str(big_root))
+    monkeypatch.setattr("lightning.fabric.utilities.cloud_io._get_cache_roots", lambda: roots_tuple)
+
+    def fake_usage(path):
+        if path == str(small_root):
+            return SimpleNamespace(
+                total=int(incoming_size * 0.8 / cloud_io._CACHE_BUDGET_FRACTION),
+                used=existing_size,
+                free=incoming_size * 10,
+            )
+        return SimpleNamespace(total=incoming_size * 20, used=0, free=incoming_size * 10)
+
+    monkeypatch.setattr(shutil, "disk_usage", fake_usage)
+
+    calls = []
+    monkeypatch.setattr(
+        "lightning.fabric.utilities.cloud_io.get_filesystem",
+        lambda _: _versioned_fs(incoming_ckpt, incoming_size, calls=calls),
+    )
+
+    loaded = _load(str(incoming_ckpt), map_location="cpu")
+    assert torch.all(loaded["weights"] == 2.0)
+    assert len(calls) == 1
+
+    # small_root's existing entry must NOT have been evicted
+    assert (existing_dir / "checkpoint.ckpt").exists()
+    # incoming_ckpt must have been cached in big_root
+    prefix = _user_cache_prefix()
+    big_entries = [d for d in os.listdir(big_root) if d.startswith(prefix) and not d.endswith(".lock")]
+    assert len(big_entries) == 1
+
+
+@_requires_cache
+def test_torch_load_holds_lock_against_concurrent_reclamation(tmp_path, monkeypatch):
+    """_torch_load must execute while holding the entry lock to prevent concurrent reclamation deleting the file."""
+    ckpt_path = tmp_path / "locked_load.ckpt"
+    size = _big_checkpoint(ckpt_path)
+    _use_tmp_cache_root(tmp_path, monkeypatch)
+
+    reclamation_attempted = False
+    reclamation_skipped = False
+    orig_torch_load = cloud_io._torch_load
+
+    def spy_torch_load(path, map_location, weights_only):
+        nonlocal reclamation_attempted, reclamation_skipped
+        cache_dir = os.path.dirname(path)
+        lock_path = f"{cache_dir}.lock"
+        reclamation_attempted = True
+        with cloud_io._entry_lock(lock_path, blocking=False) as locked:
+            if not locked:
+                reclamation_skipped = True
+            else:
+                cloud_io._remove_cache_entry(cache_dir)
+        return orig_torch_load(path, map_location, weights_only)
+
+    monkeypatch.setattr("lightning.fabric.utilities.cloud_io._torch_load", spy_torch_load)
+    monkeypatch.setattr(
+        "lightning.fabric.utilities.cloud_io.get_filesystem",
+        lambda _: _versioned_fs(ckpt_path, size),
+    )
+
+    loaded = _load(str(ckpt_path), map_location="cpu")
+    assert loaded["weights"].shape == (4096,)
+    assert reclamation_attempted
+    assert reclamation_skipped
+
+
+@_requires_cache
+def test_cache_disabled_when_max_bytes_zero(tmp_path, monkeypatch):
+    """LIGHTNING_CHECKPOINT_CACHE_MAX_BYTES=0 must disable the cache and stream."""
+    ckpt_path = tmp_path / "zero_budget.ckpt"
+    size = _big_checkpoint(ckpt_path)
+    _use_tmp_cache_root(tmp_path, monkeypatch)
+    monkeypatch.setenv("LIGHTNING_CHECKPOINT_CACHE_MAX_BYTES", "0")
+
+    calls = []
+
+    class StreamingFS:
+        def info(self, path):
+            return {"size": size, "etag": "v1"}
+
+        def open(self, path, mode):
+            calls.append("open")
+            return open(ckpt_path, mode)
+
+        def get_file(self, rpath, lpath):
+            calls.append("get_file")
+            shutil.copyfile(ckpt_path, lpath)
+
+    monkeypatch.setattr("lightning.fabric.utilities.cloud_io.get_filesystem", lambda _: StreamingFS())
+    loaded = _load(str(ckpt_path), map_location="cpu")
+    assert loaded["weights"].shape == (4096,)
+    assert "open" in calls
+    assert "get_file" not in calls
+    prefix = _user_cache_prefix()
+    assert [d for d in os.listdir(tmp_path) if d.startswith(prefix)] == []
+
+
+@_requires_cache
+def test_get_cache_roots_does_not_create_directory(tmp_path, monkeypatch):
+    """_get_cache_roots() must not create directories; _load creates them on demand."""
+    custom_root = tmp_path / "deferred" / "cache_dir"
+    monkeypatch.setenv("LIGHTNING_CHECKPOINT_CACHE_DIR", str(custom_root))
+    assert not custom_root.exists()
+
+    roots = cloud_io._get_cache_roots()
+    assert roots == (str(custom_root),)
+    assert not custom_root.exists(), "_get_cache_roots mutated the filesystem"
+
+    # clear_cache must not create custom_root either
+    cloud_io.clear_cache()
+    assert not custom_root.exists(), "clear_cache mutated the filesystem"
+
+    # _load creates custom_root when writing
+    ckpt_path = tmp_path / "test.ckpt"
+    size = _big_checkpoint(ckpt_path)
+    monkeypatch.setattr("lightning.fabric.utilities.cloud_io._CACHE_MIN_SIZE_BYTES", 1024)
+    monkeypatch.setattr("lightning.fabric.utilities.cloud_io._is_local_file_protocol", lambda _: False)
+    monkeypatch.setattr(
+        "lightning.fabric.utilities.cloud_io.get_filesystem",
+        lambda _: _versioned_fs(ckpt_path, size),
+    )
+    _load(str(ckpt_path), map_location="cpu")
+    assert custom_root.exists()

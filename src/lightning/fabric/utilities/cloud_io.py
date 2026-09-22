@@ -70,7 +70,14 @@ def _cache_enabled() -> bool:
         # Without an advisory lock every rank downloads the same object and they race on
         # `os.replace`, which fails on Windows while a peer still has the target open.
         return False
-    return os.environ.get(_CACHE_ENABLED_ENV, "1").strip().lower() not in ("0", "false", "off", "no")
+    if os.environ.get(_CACHE_ENABLED_ENV, "1").strip().lower() in ("0", "false", "off", "no"):
+        return False
+    max_bytes = os.environ.get(_CACHE_MAX_BYTES_ENV)
+    if max_bytes is not None:
+        with contextlib.suppress(ValueError):
+            if int(max_bytes) <= 0:
+                return False
+    return True
 
 
 @contextlib.contextmanager
@@ -131,8 +138,6 @@ def _get_cache_roots() -> tuple[str, ...]:
     """Return candidate cache root directories in order of preference."""
     override = os.environ.get(_CACHE_DIR_ENV)
     if override:
-        with contextlib.suppress(OSError):
-            os.makedirs(override, mode=0o700, exist_ok=True)
         return (override,)
     return ("/dev/shm", tempfile.gettempdir())
 
@@ -197,7 +202,7 @@ def _cache_budget(root: str) -> Optional[int]:
 def _evict_cache_entries(root: str, keep: str, incoming: int) -> None:
     """Evict least recently used entries until ``incoming`` extra bytes fit within ``root``'s budget."""
     budget = _cache_budget(root)
-    if budget is None:
+    if budget is None or budget < incoming:
         return
     keep_abs = os.path.abspath(keep)
     total = 0
@@ -402,7 +407,13 @@ def _load(
 
     if selected_root is None:
         for root in roots:
+            if not os.path.isdir(root):
+                with contextlib.suppress(OSError):
+                    os.makedirs(root, mode=0o700, exist_ok=True)
             if not (os.path.isdir(root) and os.access(root, os.W_OK)):
+                continue
+            budget = _cache_budget(root)
+            if budget is not None and budget < file_size:
                 continue
             _evict_cache_entries(root, os.path.join(root, cache_subdir), file_size)
             try:
@@ -465,10 +476,12 @@ def _load(
         with contextlib.suppress(OSError):
             os.utime(cache_dir)
 
+        checkpoint = _torch_load(local_path, map_location, weights_only)
+
     if downloaded:
         _reclaim_superseded_entries(path_digest, cache_dir)
 
-    return _torch_load(local_path, map_location, weights_only)
+    return checkpoint
 
 
 def get_filesystem(path: _PATH, **kwargs: Any) -> AbstractFileSystem:
