@@ -49,10 +49,11 @@ Additionally, you could also resume training with a checkpoint stored at a remot
     automatically and the superseded copy is reclaimed. If the backend reports no version
     information, the checkpoint is streamed instead of cached.
 
-    Entries outlive the process so that later jobs on the same node reuse them. To keep the RAM
-    disk from filling up, the least recently used entries are evicted once this user's checkpoints
-    occupy more than half of the cache root; ``lightning.fabric.utilities.cloud_io.clear_cache()``
-    removes them all. Three environment variables control the behavior:
+    Entries outlive the process so that later jobs on the same node reuse them. Nothing is ever
+    evicted to make room: a checkpoint is only cached when the root has room for it, so a filling
+    root simply stops accepting new entries and later loads stream instead. ``/dev/shm`` is cleared
+    on reboot, and ``lightning.fabric.utilities.cloud_io.clear_cache()`` removes every entry on
+    demand. Two environment variables control the behavior:
 
     .. list-table::
         :widths: 40 60
@@ -64,8 +65,6 @@ Additionally, you could also resume training with a checkpoint stored at a remot
           - Set to ``0`` to disable caching and always stream.
         * - ``LIGHTNING_CHECKPOINT_CACHE_DIR``
           - Use this directory instead of ``/dev/shm`` and the temporary directory.
-        * - ``LIGHTNING_CHECKPOINT_CACHE_MAX_BYTES``
-          - Byte budget per cache root, overriding the default half-of-capacity.
 
 PyTorch Lightning uses `fsspec <https://filesystem-spec.readthedocs.io/>`_ internally to handle all filesystem operations.
 

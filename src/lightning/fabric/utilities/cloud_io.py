@@ -53,12 +53,8 @@ except ImportError:  # pragma: no cover
 _CACHE_MIN_SIZE_BYTES = 128 * 1024 * 1024
 _CACHE_DIR_PREFIX = "lightning_cache_"
 _CACHE_FILE_NAME = "checkpoint.ckpt"
-# Share of a cache root this user's checkpoints may occupy before the least recently used entries
-# are evicted. /dev/shm is RAM, so an unbounded cache would eventually starve the training process.
-_CACHE_BUDGET_FRACTION = 0.5
 _CACHE_ENABLED_ENV = "LIGHTNING_CHECKPOINT_CACHE"
 _CACHE_DIR_ENV = "LIGHTNING_CHECKPOINT_CACHE_DIR"
-_CACHE_MAX_BYTES_ENV = "LIGHTNING_CHECKPOINT_CACHE_MAX_BYTES"
 # Bounds the retry loop in `_entry_lock` in case a peer keeps recreating the lock file.
 _LOCK_ATTEMPTS = 8
 _O_NOFOLLOW = getattr(os, "O_NOFOLLOW", 0)
@@ -70,14 +66,7 @@ def _cache_enabled() -> bool:
         # Without an advisory lock every rank downloads the same object and they race on
         # `os.replace`, which fails on Windows while a peer still has the target open.
         return False
-    if os.environ.get(_CACHE_ENABLED_ENV, "1").strip().lower() in ("0", "false", "off", "no"):
-        return False
-    max_bytes = os.environ.get(_CACHE_MAX_BYTES_ENV)
-    if max_bytes is not None:
-        with contextlib.suppress(ValueError):
-            if int(max_bytes) <= 0:
-                return False
-    return True
+    return os.environ.get(_CACHE_ENABLED_ENV, "1").strip().lower() not in ("0", "false", "off", "no")
 
 
 @contextlib.contextmanager
@@ -174,55 +163,6 @@ def _cache_entries(root: str) -> Iterator[str]:
         if entry not in seen:
             seen.add(entry)
             yield entry
-
-
-def _entry_size(cache_dir: str) -> int:
-    total = 0
-    for dirpath, _, filenames in os.walk(cache_dir):
-        for name in filenames:
-            with contextlib.suppress(OSError):
-                total += os.path.getsize(os.path.join(dirpath, name))
-    return total
-
-
-def _cache_budget(root: str) -> Optional[int]:
-    """Return how many bytes this user's cache may occupy in ``root``, or ``None`` if unknown."""
-    override = os.environ.get(_CACHE_MAX_BYTES_ENV)
-    if override:
-        try:
-            return max(0, int(override))
-        except ValueError:
-            log.warning(f"Ignoring non-integer {_CACHE_MAX_BYTES_ENV}={override!r}.")
-    try:
-        return int(shutil.disk_usage(root).total * _CACHE_BUDGET_FRACTION)
-    except OSError:
-        return None
-
-
-def _evict_cache_entries(root: str, keep: str, incoming: int) -> None:
-    """Evict least recently used entries until ``incoming`` extra bytes fit within ``root``'s budget."""
-    budget = _cache_budget(root)
-    if budget is None or budget < incoming:
-        return
-    keep_abs = os.path.abspath(keep)
-    total = 0
-    evictable = []
-    for entry in _cache_entries(root):
-        size = _entry_size(entry)
-        total += size
-        if os.path.abspath(entry) == keep_abs:
-            continue
-        try:
-            # `_load` touches an entry whenever it uses it, so mtime orders them by last use.
-            evictable.append((os.path.getmtime(entry), entry, size))
-        except OSError:
-            continue
-    for _, entry, size in sorted(evictable):
-        if total + incoming <= budget:
-            return
-        _remove_cache_entry(entry)
-        if not os.path.exists(entry):
-            total -= size
 
 
 def _torch_load(
@@ -412,11 +352,9 @@ def _load(
                     os.makedirs(root, mode=0o700, exist_ok=True)
             if not (os.path.isdir(root) and os.access(root, os.W_OK)):
                 continue
-            budget = _cache_budget(root)
-            if budget is not None and budget < file_size:
-                continue
-            _evict_cache_entries(root, os.path.join(root, cache_subdir), file_size)
             try:
+                # Free space is the only admission check: nothing is ever evicted to make room, so
+                # a filling root simply stops accepting new entries and later loads stream instead.
                 # Headroom on top of the payload itself: peer ranks on the node may be staging
                 # their own checkpoints into the same root at the same time.
                 if shutil.disk_usage(root).free < file_size * 1.5:
@@ -471,10 +409,6 @@ def _load(
                 # Only ever remove our own staging file, never the promoted checkpoint.
                 with contextlib.suppress(OSError):
                     os.remove(staging_path)
-
-        # Keep LRU eviction from reclaiming an entry that is still in active use.
-        with contextlib.suppress(OSError):
-            os.utime(cache_dir)
 
         checkpoint = _torch_load(local_path, map_location, weights_only)
 
