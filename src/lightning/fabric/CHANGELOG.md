@@ -12,8 +12,6 @@ The format is based on [Keep a Changelog](http://keepachangelog.com/en/1.0.0/).
 
 - Optimized remote checkpoint loading by delegating to `fs.get_file` with a node-local file lock (`fcntl.flock`), a version-keyed LRU cache and `mmap=True` in `_load`, configurable through `LIGHTNING_CHECKPOINT_CACHE`, `LIGHTNING_CHECKPOINT_CACHE_DIR` and `LIGHTNING_CHECKPOINT_CACHE_MAX_BYTES` ([#21869](https://github.com/Lightning-AI/pytorch-lightning/pull/21869))
 
-- Local checkpoints are now memory-mapped (`mmap=True`) in `_load` instead of being read through a file object ([#21869](https://github.com/Lightning-AI/pytorch-lightning/pull/21869))
-
 - Added `lightning.fabric.utilities.cloud_io.clear_cache` to drop the node-local remote checkpoint cache ([#21869](https://github.com/Lightning-AI/pytorch-lightning/pull/21869))
 
 - Added support for remote storage (fsspec URLs) when saving and loading distributed checkpoints with `FSDPStrategy` ([#21775](https://github.com/Lightning-AI/pytorch-lightning/pull/21775))
@@ -24,7 +22,7 @@ The format is based on [Keep a Changelog](http://keepachangelog.com/en/1.0.0/).
 
 ### Changed
 
--
+- Local checkpoints are now memory-mapped (`mmap=True`) in `_load` instead of being read through a file object ([#21869](https://github.com/Lightning-AI/pytorch-lightning/pull/21869))
 
 ### Removed
 

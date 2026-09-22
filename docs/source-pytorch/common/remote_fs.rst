@@ -52,7 +52,7 @@ Additionally, you could also resume training with a checkpoint stored at a remot
     Entries outlive the process so that later jobs on the same node reuse them. To keep the RAM
     disk from filling up, the least recently used entries are evicted once this user's checkpoints
     occupy more than half of the cache root; ``lightning.fabric.utilities.cloud_io.clear_cache()``
-    removes them all. Three environment variables control the behaviour:
+    removes them all. Three environment variables control the behavior:
 
     .. list-table::
         :widths: 40 60

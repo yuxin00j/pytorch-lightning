@@ -756,7 +756,7 @@ def _mp_worker(ckpt_path_str, cache_root_str, counter_dir_str, size, barrier):
     assert res["weights"].shape == (4096,)
 
 
-@pytest.mark.skipif(sys.platform == "win32", reason="fork-based barrier test")
+@pytest.mark.skipif(sys.platform != "linux", reason="fork-based barrier test requires Linux")
 def test_load_remote_multiprocess_singleflight(tmp_path):
     """Multiple processes loading the same remote checkpoint concurrently must download it exactly once."""
     ckpt_path = tmp_path / "mp.ckpt"
@@ -813,8 +813,7 @@ def test_cache_can_be_disabled_by_env(tmp_path, monkeypatch):
 def test_cache_root_can_be_overridden_by_env(tmp_path, monkeypatch):
     ckpt_path = tmp_path / "override.ckpt"
     size = _big_checkpoint(ckpt_path)
-    cache_root = tmp_path / "custom_cache"
-    cache_root.mkdir()
+    cache_root = tmp_path / "custom_cache" / "nested"
 
     monkeypatch.setattr("lightning.fabric.utilities.cloud_io._CACHE_MIN_SIZE_BYTES", 1024)
     monkeypatch.setattr("lightning.fabric.utilities.cloud_io._is_local_file_protocol", lambda _: False)

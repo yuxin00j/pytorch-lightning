@@ -635,5 +635,4 @@ linkcheck_ignore = [
     "https://openai.com/blog/.*",
     "https://openai.com/index/*",
     "https://tinyurl.com/.*",  # has a human verification check on redirect
-    r"https://(www\.)?pytorchlightning\.ai/.*",
 ]

@@ -131,6 +131,8 @@ def _get_cache_roots() -> tuple[str, ...]:
     """Return candidate cache root directories in order of preference."""
     override = os.environ.get(_CACHE_DIR_ENV)
     if override:
+        with contextlib.suppress(OSError):
+            os.makedirs(override, mode=0o700, exist_ok=True)
         return (override,)
     return ("/dev/shm", tempfile.gettempdir())
 
