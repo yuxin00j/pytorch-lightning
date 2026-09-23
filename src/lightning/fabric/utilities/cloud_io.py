@@ -354,32 +354,45 @@ def _try_cached_load(
             log.warning(f"Cannot lock the checkpoint cache entry {cache_dir}; streaming instead.")
             return False, None
 
-        if not _cached_file_is_complete(local_path, file_size):
+        # A loop, not a single check: if the rank holding LOCK_EX dies mid-download, every waiter
+        # wakes with the file still missing and one of them has to take over.
+        while not _cached_file_is_complete(local_path, file_size):
             if _HAS_FCNTL and fd is not None and not exclusive:
-                # The peer holding LOCK_EX failed before promoting the file; upgrade to exclusive so
-                # only one surviving waiter re-runs the download.
+                # The downloader died before promoting the file, so try to take over. The request
+                # must be non-blocking: a blocking LOCK_EX is not woken by the next downloader's
+                # downgrade to LOCK_SH, so every waiter would end up unpickling in series rather
+                # than together, which is the whole point of the downgrade.
                 fcntl.flock(fd, fcntl.LOCK_UN)
-                fcntl.flock(fd, fcntl.LOCK_EX)
-                exclusive = True
-
-            if not _cached_file_is_complete(local_path, file_size):
-                size_gb = file_size / (1024**3)
-                log.info(f"Fetching {path_str} ({size_gb:.2f} GB) to {staging_path}...")
-
                 try:
-                    fs.get_file(path_str, staging_path)
-                    staged_size = os.path.getsize(staging_path)
-                    if staged_size < file_size:
-                        raise OSError(
-                            f"Truncated download of {path_str}: expected {file_size} bytes, got {staged_size}"
-                        )
-                    os.chmod(staging_path, 0o600)
-                    os.replace(staging_path, local_path)
-                    downloaded = True
-                finally:
-                    # Only ever remove our own staging file, never the promoted checkpoint.
-                    with contextlib.suppress(OSError):
-                        os.remove(staging_path)
+                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    exclusive = True
+                except OSError:
+                    # Another waiter got there first; park until it downgrades, then re-check.
+                    fcntl.flock(fd, fcntl.LOCK_SH)
+                    continue
+
+            size_gb = file_size / (1024**3)
+            log.info(f"Fetching {path_str} ({size_gb:.2f} GB) to {staging_path}...")
+
+            # A rank killed mid-download leaves its staging file behind, and nothing else ever
+            # reaps them even though each one is the size of a whole checkpoint. We hold the entry
+            # exclusively here, so anything still staged is abandoned.
+            for abandoned in glob.glob(os.path.join(cache_dir, f"{_CACHE_FILE_NAME}.tmp.*")):
+                with contextlib.suppress(OSError):
+                    os.remove(abandoned)
+
+            try:
+                fs.get_file(path_str, staging_path)
+                staged_size = os.path.getsize(staging_path)
+                if staged_size < file_size:
+                    raise OSError(f"Truncated download of {path_str}: expected {file_size} bytes, got {staged_size}")
+                os.chmod(staging_path, 0o600)
+                os.replace(staging_path, local_path)
+                downloaded = True
+            finally:
+                # Only ever remove our own staging file, never the promoted checkpoint.
+                with contextlib.suppress(OSError):
+                    os.remove(staging_path)
 
         # Downgrade LOCK_EX -> LOCK_SH so all waiting peer ranks can unpickle concurrently while
         # still blocking concurrent _remove_cache_entry (which requires LOCK_EX | LOCK_NB).

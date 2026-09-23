@@ -638,7 +638,7 @@ def test_load_remote_cleanup_on_exception(tmp_path, monkeypatch):
 
 
 def test_load_remote_atomic_staging_recovery(tmp_path, monkeypatch):
-    """An orphaned staging file from a killed process must not be mistaken for the payload."""
+    """An orphaned staging file from a killed process must be ignored, then reaped."""
     ckpt_path = tmp_path / "staged.ckpt"
     size = _big_checkpoint(ckpt_path)
 
@@ -661,6 +661,8 @@ def test_load_remote_atomic_staging_recovery(tmp_path, monkeypatch):
     assert res["weights"].shape == (4096,)
     assert (cache_dir / "checkpoint.ckpt").exists()
     assert os.path.getsize(cache_dir / "checkpoint.ckpt") == size
+    # Staging files are checkpoint-sized, so leaving them behind would fill the cache root.
+    assert not orphan_tmp.exists(), "the abandoned staging file was ignored but never reclaimed"
 
 
 def test_load_remote_info_exception_fallback(tmp_path, monkeypatch):
