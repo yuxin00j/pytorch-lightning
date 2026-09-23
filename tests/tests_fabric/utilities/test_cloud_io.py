@@ -1053,3 +1053,73 @@ def test_get_cache_roots_does_not_create_directory(tmp_path, monkeypatch):
     )
     _load(str(ckpt_path), map_location="cpu")
     assert custom_root.exists()
+
+
+@_requires_cache
+def test_stale_unlocked_lock_file_does_not_pin_full_root(tmp_path, monkeypatch):
+    """An unlocked .lock left behind by a failed download must not pin a full primary root."""
+    ckpt_path = tmp_path / "retry_after_failure.ckpt"
+    size = _big_checkpoint(ckpt_path)
+
+    shm_root = tmp_path / "shm"
+    disk_root = tmp_path / "disk"
+    shm_root.mkdir()
+    disk_root.mkdir()
+
+    monkeypatch.delenv("LIGHTNING_CHECKPOINT_CACHE", raising=False)
+    monkeypatch.delenv("LIGHTNING_CHECKPOINT_CACHE_DIR", raising=False)
+    monkeypatch.setattr("lightning.fabric.utilities.cloud_io._CACHE_MIN_SIZE_BYTES", 1024)
+    monkeypatch.setattr("lightning.fabric.utilities.cloud_io._is_local_file_protocol", lambda _: False)
+    monkeypatch.setattr(
+        "lightning.fabric.utilities.cloud_io._get_cache_roots",
+        lambda: (str(shm_root), str(disk_root)),
+    )
+
+    # First attempt: shm_root has plenty of space, but the download fails mid-flight, leaving an
+    # unlocked `<entry>.lock` file in shm_root.
+    class FailOnceFS:
+        def __init__(self):
+            self.attempts = 0
+            self._inner = _versioned_fs(ckpt_path, size)
+
+        def info(self, path):
+            return self._inner.info(path)
+
+        def get_file(self, rpath, lpath):
+            self.attempts += 1
+            if self.attempts == 1:
+                raise OSError("transient network error")
+            return self._inner.get_file(rpath, lpath)
+
+        def open(self, path, mode="rb"):
+            return self._inner.open(path, mode)
+
+    fs = FailOnceFS()
+    monkeypatch.setattr("lightning.fabric.utilities.cloud_io.get_filesystem", lambda _: fs)
+
+    with pytest.raises(OSError, match="transient network error"):
+        _load(str(ckpt_path), map_location="cpu")
+
+    shm_locks = [f for f in os.listdir(shm_root) if f.endswith(".lock")]
+    assert len(shm_locks) == 1, "Failed download should have created the lock file in shm_root"
+
+    # Now shm_root fills up (free = 0). The leftover unlocked .lock in shm_root must NOT trick
+    # root selection into picking shm_root and bypassing the free-space check; the retry must fall
+    # through to disk_root.
+    from collections import namedtuple
+
+    Usage = namedtuple("usage", ["total", "used", "free"])
+    monkeypatch.setattr(
+        "lightning.fabric.utilities.cloud_io.shutil.disk_usage",
+        lambda path: (
+            Usage(size * 10, size * 10, 0) if str(path).startswith(str(shm_root)) else Usage(size * 10, 0, size * 10)
+        ),
+    )
+
+    loaded = _load(str(ckpt_path), map_location="cpu")
+    assert loaded["weights"].shape == (4096,)
+
+    prefix = _user_cache_prefix()
+    disk_entries = [d for d in os.listdir(disk_root) if d.startswith(prefix) and not d.endswith(".lock")]
+    assert len(disk_entries) == 1
+    assert os.path.exists(os.path.join(disk_root, disk_entries[0], "checkpoint.ckpt"))
