@@ -651,7 +651,9 @@ def test_load_remote_atomic_staging_recovery(tmp_path, monkeypatch):
     path_digest = hashlib.sha256(str(ckpt_path).encode()).hexdigest()[:16]
     version_digest = hashlib.sha256(f"v1:{size}".encode()).hexdigest()[:16]
     cache_dir = tmp_path / f"{_user_cache_prefix()}{path_digest}_{version_digest}"
-    cache_dir.mkdir(parents=True, exist_ok=True)
+    # A killed process would have created this with 0o700; anything looser is treated as untrusted
+    # and refused, so reproduce the real mode here.
+    cache_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
     orphan_tmp = cache_dir / "checkpoint.ckpt.tmp.999999.deadbeef"
     orphan_tmp.write_bytes(b"0" * 1024)
 
@@ -734,7 +736,11 @@ def test_clear_cache_removes_entries(tmp_path, monkeypatch):
     assert [d for d in os.listdir(tmp_path) if d.startswith(prefix)]
 
     clear_cache()
-    assert [d for d in os.listdir(tmp_path) if d.startswith(prefix)] == []
+    remaining = [d for d in os.listdir(tmp_path) if d.startswith(prefix)]
+    # The payload directories are gone. Only the empty lock markers survive: unlinking one is unsafe
+    # while a peer may be blocked on it, and they cost an inode each.
+    assert all(d.endswith(".lock") for d in remaining), remaining
+    assert all(os.path.getsize(os.path.join(tmp_path, d)) == 0 for d in remaining)
 
 
 def _mp_worker(ckpt_path_str, cache_root_str, counter_dir_str, size, barrier):

@@ -55,8 +55,6 @@ _CACHE_DIR_PREFIX = "lightning_cache_"
 _CACHE_FILE_NAME = "checkpoint.ckpt"
 _CACHE_ENABLED_ENV = "LIGHTNING_CHECKPOINT_CACHE"
 _CACHE_DIR_ENV = "LIGHTNING_CHECKPOINT_CACHE_DIR"
-# Bounds the retry loop in `_entry_lock` in case a peer keeps recreating the lock file.
-_LOCK_ATTEMPTS = 8
 _O_NOFOLLOW = getattr(os, "O_NOFOLLOW", 0)
 
 
@@ -73,13 +71,10 @@ def _cache_enabled() -> bool:
 def _entry_lock(lock_path: str, blocking: bool = True) -> Iterator[tuple[Optional[int], bool]]:
     """Hold the node-local advisory lock guarding one cache entry, using stdlib ``fcntl.flock``.
 
-    Yields ``(fd, exclusive)``. The first caller to enter acquires an exclusive lock (``LOCK_EX``)
-    with ``exclusive=True``; concurrent blocking callers wait for a shared lock (``LOCK_SH``) and
-    resume together with ``exclusive=False`` as soon as the downloader downgrades to ``LOCK_SH``
-    before ``_torch_load``. A non-blocking attempt yields ``(None, False)`` when another process is
-    already inside the entry. Reclamation may unlink a lock file while we wait on it, leaving us
-    holding an orphaned inode that guards nothing, so the locked inode is compared against the one
-    now at ``lock_path`` and the acquisition is retried if they differ.
+    Yields ``(fd, exclusive)``. The first caller into the entry takes it exclusively (``LOCK_EX``)
+    and gets ``exclusive=True``; blocking callers that find it taken instead wait on ``LOCK_SH`` and
+    resume together with ``exclusive=False`` once the downloader downgrades before loading. A
+    non-blocking attempt yields ``(None, False)`` when another process is already inside the entry.
 
     """
     if not _HAS_FCNTL:  # pragma: no cover
@@ -88,13 +83,11 @@ def _entry_lock(lock_path: str, blocking: bool = True) -> Iterator[tuple[Optiona
     fd: Optional[int] = None
     exclusive = False
     try:
-        for _ in range(_LOCK_ATTEMPTS):
-            try:
-                fd = os.open(lock_path, os.O_CREAT | os.O_RDWR | _O_NOFOLLOW, 0o600)
-            except OSError as e:
-                log.debug(f"Cannot open the checkpoint cache lock {lock_path} ({e}).")
-                fd = None
-                break
+        try:
+            fd = os.open(lock_path, os.O_CREAT | os.O_RDWR | _O_NOFOLLOW, 0o600)
+        except OSError as e:
+            log.debug(f"Cannot open the checkpoint cache lock {lock_path} ({e}).")
+        if fd is not None:
             try:
                 fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
                 exclusive = True
@@ -102,20 +95,9 @@ def _entry_lock(lock_path: str, blocking: bool = True) -> Iterator[tuple[Optiona
                 if not blocking:
                     os.close(fd)
                     fd = None
-                    break
-                try:
+                else:
+                    # Wait for the downloader to finish and downgrade, then load alongside it.
                     fcntl.flock(fd, fcntl.LOCK_SH)
-                    exclusive = False
-                except OSError:
-                    os.close(fd)
-                    fd = None
-                    break
-            with contextlib.suppress(OSError):
-                if os.stat(lock_path).st_ino == os.fstat(fd).st_ino:
-                    break
-            fcntl.flock(fd, fcntl.LOCK_UN)
-            os.close(fd)
-            fd = None
         yield fd, exclusive
     finally:
         if fd is not None:
@@ -133,15 +115,19 @@ def _is_entry_active(lock_path: str) -> bool:
 
 
 def _remove_cache_entry(cache_dir: str) -> None:
-    """Delete a cache entry and its lock, skipping it while another process is using it."""
-    lock_path = f"{cache_dir}.lock"
-    with _entry_lock(lock_path, blocking=False) as (fd, _):
+    """Delete a cache entry's payload, skipping it while another process is using it.
+
+    The empty lock file is deliberately left behind. Unlinking it would let a peer that is blocked
+    in ``flock`` wake up holding an inode with no name, while a newcomer creates and locks the
+    replacement file, so both would believe they own the entry and one could delete the directory
+    out from under the other.
+
+    """
+    with _entry_lock(f"{cache_dir}.lock", blocking=False) as (fd, _):
         if _HAS_FCNTL and fd is None:
             log.debug(f"Not reclaiming {cache_dir}: another process is still using it.")
             return
         shutil.rmtree(cache_dir, ignore_errors=True)
-        with contextlib.suppress(OSError):
-            os.remove(lock_path)
 
 
 def _get_cache_roots() -> tuple[str, ...]:
@@ -253,7 +239,9 @@ def _reclaim_superseded_entries(path_digest: str, keep: str) -> None:
 def clear_cache() -> None:
     """Remove every local checkpoint cache entry written by :func:`_load` for the current user.
 
-    Entries that another process is currently downloading into are left alone.
+    Entries that another process is currently downloading into or loading from are left alone. The
+    empty ``.lock`` marker files are kept, since removing one is unsafe while a peer may be waiting
+    on it; they cost an inode each and are cleared when the root is (``/dev/shm`` on reboot).
 
     """
     for root in _get_cache_roots():
@@ -339,8 +327,12 @@ def _try_cached_load(
 
     cache_dir = os.path.join(selected_root, cache_subdir)
     try:
+        # Deliberately no `os.chmod` here. The roots are world-writable, so another local user can
+        # plant a symlink at `cache_dir`; `os.chmod` follows symlinks and would apply the mode to
+        # whatever the link points at. `mkdir` already caps the new directory at 0o700 (a umask can
+        # only clear bits, never add them), and `_is_private_dir` below rejects anything we did not
+        # create ourselves.
         os.makedirs(cache_dir, mode=0o700, exist_ok=True)
-        os.chmod(cache_dir, 0o700)
     except OSError as e:
         log.warning(f"Cannot prepare the checkpoint cache directory {cache_dir} ({e}); streaming instead.")
         return False, None

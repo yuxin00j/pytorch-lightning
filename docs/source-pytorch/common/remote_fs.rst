@@ -52,8 +52,9 @@ Additionally, you could also resume training with a checkpoint stored at a remot
     Entries outlive the process so that later jobs on the same node reuse them. Nothing is ever
     evicted to make room: a checkpoint is only cached when the root has room for it, so a filling
     root simply stops accepting new entries and later loads stream instead. ``/dev/shm`` is cleared
-    on reboot, and ``lightning.fabric.utilities.cloud_io.clear_cache()`` removes every entry on
-    demand. Two environment variables control the behavior:
+    on reboot, and ``lightning.fabric.utilities.cloud_io.clear_cache()`` reclaims the cached
+    checkpoints on demand (empty lock marker files are left behind, since removing one is unsafe
+    while another rank may be waiting on it). Two environment variables control the behavior:
 
     .. list-table::
         :widths: 40 60
