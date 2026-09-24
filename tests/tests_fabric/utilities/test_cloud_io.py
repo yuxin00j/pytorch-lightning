@@ -685,6 +685,7 @@ def test_load_remote_info_exception_fallback(tmp_path, monkeypatch):
     torch.testing.assert_close(loaded["weights"], checkpoint["weights"])
 
 
+@_requires_cache
 def test_load_remote_shm_cache_and_repeat_hit_when_free_space_drops(tmp_path, monkeypatch):
     """Once cached in /dev/shm, subsequent loads must hit /dev/shm even if free space drops below 1.5x."""
     ckpt_path = tmp_path / "shm.ckpt"
