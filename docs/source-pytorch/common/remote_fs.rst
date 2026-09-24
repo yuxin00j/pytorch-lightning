@@ -54,7 +54,10 @@ Additionally, you could also resume training with a checkpoint stored at a remot
     root simply stops accepting new entries and later loads stream instead. ``/dev/shm`` is cleared
     on reboot, and ``lightning.fabric.utilities.cloud_io.clear_cache()`` reclaims the cached
     checkpoints on demand (empty lock marker files are left behind, since removing one is unsafe
-    while another rank may be waiting on it). Two environment variables control the behavior:
+    while another rank may be waiting on it). An entry in ``/dev/shm`` stays resident in RAM and,
+    in containers, counts toward the container's memory limit even after the process exits; point
+    the cache at local disk or disable it if that headroom is tight. Two environment variables
+    control the behavior:
 
     .. list-table::
         :widths: 40 60

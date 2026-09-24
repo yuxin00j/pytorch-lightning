@@ -228,11 +228,10 @@ def _cached_file_is_complete(path: str, remote_size: int) -> bool:
 def _reclaim_superseded_entries(path_digest: str, keep: str) -> None:
     """Delete older cache entries for the same remote path across candidate roots."""
     keep_abs = os.path.abspath(keep)
+    prefix = f"{_user_cache_prefix()}{path_digest}_"
     for root in _get_cache_roots():
         for stale in _cache_entries(root):
-            if os.path.basename(stale).startswith(f"{_user_cache_prefix()}{path_digest}_") and (
-                os.path.abspath(stale) != keep_abs
-            ):
+            if os.path.basename(stale).startswith(prefix) and os.path.abspath(stale) != keep_abs:
                 _remove_cache_entry(stale)
 
 
