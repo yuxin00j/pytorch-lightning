@@ -406,7 +406,8 @@ def test_load_remote_small_file_streaming(tmp_path, monkeypatch):
 
 
 def test_load_remote_size_none_and_version_zero(tmp_path, monkeypatch):
-    """fs.info() returning size=None must stream without TypeError; generation=0 must be accepted as a valid version."""
+    """fs.info() returning size=None must stream without TypeError; generation=0 must be accepted as a valid
+    version."""
     ckpt_path = tmp_path / "size_none.ckpt"
     size = _big_checkpoint(ckpt_path, fill=3.0)
     _use_tmp_cache_root(tmp_path, monkeypatch)

@@ -200,9 +200,9 @@ def _torch_load(
 def _remote_version(file_info: dict[str, Any]) -> str:
     """Return a token that changes whenever the remote object's content changes.
 
-    Only strong validators are accepted. A modification time is too coarse to key a cache on: an
-    overwrite within the same second that keeps the size is indistinguishable from the original, so
-    the stale weights would be served. Objects without one are streamed instead of cached.
+    Only strong validators are accepted. A modification time is too coarse to key a cache on: an overwrite within the
+    same second that keeps the size is indistinguishable from the original, so the stale weights would be served.
+    Objects without one are streamed instead of cached.
 
     """
     for key in ("etag", "ETag", "generation", "version_id", "VersionId"):
