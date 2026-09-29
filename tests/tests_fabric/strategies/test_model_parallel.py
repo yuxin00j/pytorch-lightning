@@ -428,3 +428,87 @@ def test_model_parallel_load_checkpoint_loads_non_tensor_metadata(monkeypatch, t
     mp._load_checkpoint(path=ckpt_dir, state=state, strict=False)
     assert isinstance(state["user_meta"], _NonTensorMeta)
     assert state["user_meta"].value == 42
+
+
+def _load_full_checkpoint_on_rank0_only(rank, world_size, tmp_path, checkpoint_format):
+    import torch.distributed as dist
+    from torch.distributed.checkpoint.state_dict import (
+        StateDictOptions,
+        get_model_state_dict,
+        get_optimizer_state_dict,
+    )
+    from torch.distributed.device_mesh import init_device_mesh
+    from torch.distributed.fsdp import fully_shard
+
+    from lightning.fabric.strategies.model_parallel import _load_checkpoint, _load_raw_module_state_from_path
+
+    dist.init_process_group(
+        "gloo",
+        init_method=f"file://{tmp_path / 'store'}",
+        rank=rank,
+        world_size=world_size,
+        timeout=timedelta(seconds=60),
+    )
+    try:
+        mesh = init_device_mesh("cpu", (world_size,))
+
+        def build(seed):
+            torch.manual_seed(seed)
+            model = fully_shard(nn.Linear(4, 4), mesh=mesh)
+            optimizer = Adam(model.parameters())
+            for p in model.parameters():
+                p.grad = torch.full_like(p, float(seed + 1))
+            optimizer.step()
+            return model, optimizer
+
+        model, optimizer = build(seed=0)
+        options = StateDictOptions(full_state_dict=True, cpu_offload=True)
+        model_state = get_model_state_dict(model, options=options)
+        optimizer_state = get_optimizer_state_dict(model, optimizer, options=options)
+        full_path = tmp_path / "full.ckpt"
+        if rank == 0:
+            if checkpoint_format == "fabric":
+                torch.save({"model": model_state, "optimizer": optimizer_state, "step": 7}, full_path)
+            elif checkpoint_format == "pytorch":
+                torch.save({"model": model_state, "optimizer_states": [optimizer_state], "step": 7}, full_path)
+            else:
+                torch.save(model_state, full_path)
+        dist.barrier()
+
+        # Only rank 0 gets the real file. Any other rank that reads its path fails to unpickle it.
+        path = full_path
+        if rank != 0:
+            path = tmp_path / f"unreadable-{rank}.ckpt"
+            path.write_bytes(b"not a checkpoint")
+
+        new_model, new_optimizer = build(seed=1)
+        if checkpoint_format == "fabric":
+            state = {"model": new_model, "optimizer": new_optimizer, "step": None}
+            _load_checkpoint(path=path, state=state)
+            assert state["step"] == 7
+        elif checkpoint_format == "pytorch":
+            state = {"model": new_model, "optimizer_0": new_optimizer}
+            remainder = _load_checkpoint(path=path, state=state, optimizer_states_from_list=True)
+            assert remainder["step"] == 7
+            assert "optimizer_states" in remainder
+        else:
+            _load_raw_module_state_from_path(path, module=new_model, world_size=world_size)
+
+        for expected, actual in zip(model.parameters(), new_model.parameters()):
+            torch.testing.assert_close(actual.full_tensor(), expected.full_tensor())
+            if checkpoint_format != "module":
+                for key in ("exp_avg", "exp_avg_sq"):
+                    torch.testing.assert_close(
+                        new_optimizer.state[actual][key].full_tensor(), optimizer.state[expected][key].full_tensor()
+                    )
+    finally:
+        dist.destroy_process_group()
+
+
+@RunIf(min_torch="2.4", skip_windows=True)
+@pytest.mark.parametrize("checkpoint_format", ["fabric", "pytorch", "module"])
+def test_full_checkpoint_is_read_only_on_rank_zero(tmp_path, checkpoint_format):
+    """The other ranks receive their shards through ``broadcast_from_rank0``, so they must not read the file."""
+    torch.multiprocessing.spawn(
+        _load_full_checkpoint_on_rank0_only, args=(2, tmp_path, checkpoint_format), nprocs=2, join=True
+    )

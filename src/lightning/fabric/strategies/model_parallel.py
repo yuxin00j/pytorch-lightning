@@ -472,11 +472,15 @@ def _load_checkpoint(
 
     if _is_full_checkpoint(path):
         weights_only = False if weights_only is None else weights_only
-        if _is_local_file_protocol(str(path)):
+        # The model and optimizer states reach the other ranks through `broadcast_from_rank0`, so only rank 0 reads
+        is_rank_zero = torch.distributed.get_rank() == 0
+        if not is_rank_zero:
+            checkpoint = {}
+        elif _is_local_file_protocol(str(path)):
             checkpoint = torch.load(path, mmap=True, map_location="cpu", weights_only=weights_only)
         else:
             checkpoint = _load(path, map_location="cpu", weights_only=weights_only)
-        _load_raw_module_state(checkpoint.pop(module_key), module, strict=strict)
+        _load_raw_module_state(checkpoint.pop(module_key, {}), module, strict=strict)
 
         state_dict_options = StateDictOptions(
             broadcast_from_rank0=True,
@@ -487,17 +491,28 @@ def _load_checkpoint(
             if optimizer_states_from_list:
                 # This code path is only used by `lightning.pytorch`, which saves optimizer states as a list
                 # rather than individual states at the top level.
-                optimizer_state = checkpoint["optimizer_states"][optimizer_idx]
+                optimizer_state = checkpoint["optimizer_states"][optimizer_idx] if is_rank_zero else {}
             else:
-                optimizer_state = checkpoint.pop(optimizer_name)
+                optimizer_state = checkpoint.pop(optimizer_name) if is_rank_zero else {}
 
-            optimizer_state = _rekey_optimizer_state_if_needed(optimizer_state, module)
+            if is_rank_zero:
+                optimizer_state = _rekey_optimizer_state_if_needed(optimizer_state, module)
             set_optimizer_state_dict(
                 module,
                 optimizer,
                 optim_state_dict=optimizer_state,
                 options=state_dict_options,
             )
+
+        # Send the remaining metadata to the other ranks, without the optimizer states they already received
+        skipped_key = "optimizer_states" if optimizer_states_from_list else None
+        metadata = [{k: v for k, v in checkpoint.items() if k != skipped_key}]
+        torch.distributed.broadcast_object_list(metadata, src=0)
+        if not is_rank_zero:
+            checkpoint = metadata[0]
+            if optimizer_states_from_list:
+                # `lightning.pytorch` only checks that this key exists, the states were restored above
+                checkpoint["optimizer_states"] = [{} for _ in optimizers]
 
         requested_metadata_keys = state.keys() - modules.keys() - optimizers.keys()
         _validate_keys_for_strict_loading(requested_metadata_keys, checkpoint.keys(), strict=strict)
@@ -548,7 +563,10 @@ def _load_raw_module_state_from_path(path: _PATH, module: Module, world_size: in
             "Failed to load checkpoint directly into the model. The given path must be a single file containing the"
             f" full state dict: {path}"
         )
-    if _is_local_file_protocol(str(path)):
+    if _has_dtensor_modules(module) and torch.distributed.get_rank() != 0:
+        # The weights reach this rank through `broadcast_from_rank0`, so only rank 0 reads the file
+        state_dict = {}
+    elif _is_local_file_protocol(str(path)):
         # Use `mmap` to avoid storing a copy of the full checkpoint per rank
         state_dict = torch.load(path, mmap=True, map_location="cpu")
     else:
@@ -572,17 +590,21 @@ def _load_raw_module_state(
             strict=False,
         )
 
+        # Only rank 0 needs the tensors, but every rank must issue the same collectives below, so they follow its keys
+        checkpoint_keys = [set(state_dict)]
+        torch.distributed.broadcast_object_list(checkpoint_keys, src=0)
+
         for submodule_name, submodule in module.named_modules():
             for param_name, _ in _named_parameters_and_buffers_to_load(submodule):
                 full_param_name = f"{submodule_name}{'.' if submodule_name else ''}{param_name}"
-                if full_param_name not in state_dict:
+                if full_param_name not in checkpoint_keys[0]:
                     if not strict:
                         continue
                     raise KeyError(
                         f"The model contains a key '{full_param_name}' that does not exist in the loaded checkpoint."
                         " To disable strict loading, set `strict=False`."
                     )
-                local_state_dict = {param_name: state_dict[full_param_name]}
+                local_state_dict = {param_name: state_dict[full_param_name]} if full_param_name in state_dict else {}
                 set_model_state_dict(submodule, local_state_dict, options=state_dict_options)
 
     elif isinstance(module, FSDP):
